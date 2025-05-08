@@ -5,8 +5,8 @@
           "src": "backend/main.py",
           "use": "@vercel/python",
           "config": {
-            "maxLambdaSize": "50mb", // Increase if needed for dependencies
-            "runtime": "python3.11" // Or your preferred Python version
+            "maxLambdaSize": "50mb",
+            "runtime": "python3.11"
            }
         },
         {
@@ -14,25 +14,25 @@
            "use": "@vercel/static"
         },
          {
-           "src": "backend/static/charts/**", // Route for chart images
+           "src": "backend/static/charts/**",
            "use": "@vercel/static"
         }
       ],
       "routes": [
         {
-          "src": "/static/charts/(.*)", // Requests to /static/charts/...
-          "dest": "/backend/static/charts/$1" // Serve from backend/static/charts/...
+          "src": "/static/charts/(.*)",
+          "dest": "/backend/static/charts/$1"
         },
         {
-          "src": "/analyze", // API endpoint
-          "dest": "backend/main.py" // Route to the FastAPI app
+          "src": "/analyze",
+          "dest": "backend/main.py"
         },
         {
-          "src": "/", // Root path
-          "dest": "/frontend/index.html" // Serve the frontend HTML
+          "src": "/",
+          "dest": "/frontend/index.html"
         },
          {
-           "src": "/(.*)", // Catch-all for other API routes if you add more
+           "src": "/(.*)",
            "dest": "backend/main.py"
         }
       ]
