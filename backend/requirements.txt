@@ -1,0 +1,17 @@
+    # backend/requirements.txt
+
+    fastapi
+    uvicorn[standard]
+    pydantic
+
+    openai
+    langchain
+    langgraph
+    langchain-openai
+    langchain-core
+    yfinance
+    pandas
+    ta
+    numpy
+    matplotlib # Added for chart generation
+    # langsmith # Optional
