@@ -13,5 +13,7 @@
     pandas
     ta
     numpy
-    matplotlib # Added for chart generation
+    matplotlib
+    gunicorn
+    # Added for chart generation
     # langsmith # Optional

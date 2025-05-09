@@ -1,14 +1,14 @@
 # backend/stock_analyzer.py
-from dotenv import load_dotenv
-load_dotenv()
+
 import os
 import json
 from typing import TypedDict, List, Optional, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.pydantic_v1 import BaseModel, Field  # Pydantic v1 for LangChain compatibility
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate  # For structured prompts
+from langchain_core.output_parsers import StrOutputParser  # For simple string output
 from langgraph.graph import StateGraph, END
-# from langgraph.checkpoint.sqlite import SqliteSaver # Optional: for state persistence
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -17,20 +17,14 @@ from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.momentum import RSIIndicator
 import warnings
 from io import StringIO
-import asyncio  # For async operations
-import uuid  # For unique filenames
-import matplotlib  # Ensure matplotlib uses a non-interactive backend
+import asyncio
+import re
+from dotenv import load_dotenv
 
-matplotlib.use('Agg')  # Use 'Agg' backend for generating files without GUI
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates  # For date formatting on plots
-import re  # For basic ticker format check
+load_dotenv()
 
-# --- Suppress Warnings ---
 warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module='matplotlib')
 
-# --- Constants and Configuration ---
 ENV_OPENAI_API_KEY = "OPENAI_API_KEY"
 ENV_LANGCHAIN_TRACING_V2 = "LANGCHAIN_TRACING_V2"
 ENV_LANGCHAIN_ENDPOINT = "LANGCHAIN_ENDPOINT"
@@ -44,42 +38,34 @@ LANGCHAIN_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", os.getenv(ENV_LANGCHAIN_END
 LANGCHAIN_API_KEY = os.getenv("LANGSMITH_API_KEY", os.getenv(ENV_LANGCHAIN_API_KEY))
 LANGCHAIN_PROJECT = os.getenv("LANGSMITH_PROJECT", os.getenv(ENV_LANGCHAIN_PROJECT, "Stock Analyzer Chat App Async"))
 
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.4))  # Slightly lower temp for more focused summaries
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 500))  # Reduced max tokens for summaries
-POSITION_ADVICE_MAX_TOKENS = int(
-    os.getenv("POSITION_ADVICE_MAX_TOKENS", 700))  # Allow slightly more for position advice levels
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o")  # Changed to gpt-4o for better reasoning
+LLM_SYMBOL_RESOLUTION_MODEL = os.getenv("LLM_SYMBOL_RESOLUTION_MODEL",
+                                        "gpt-3.5-turbo")  # Cheaper/faster for symbol resolution
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.4))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 500))
+POSITION_ADVICE_MAX_TOKENS = int(os.getenv("POSITION_ADVICE_MAX_TOKENS", 700))
 TOOL_SELECTOR_LLM_MAX_TOKENS = int(os.getenv("TOOL_SELECTOR_LLM_MAX_TOKENS", 250))
 
-# --- Static File Configuration ---
-backend_dir = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(backend_dir, "static")
-CHARTS_DIR = os.path.join(STATIC_DIR, "charts")
-os.makedirs(CHARTS_DIR, exist_ok=True)
-CHARTS_URL_PREFIX = "/static/charts"
+CHARTS_DIR = "/tmp/charts"
+try:
+    os.makedirs(CHARTS_DIR, exist_ok=True)
+except OSError as e:
+    print(f"Warning: Could not create CHARTS_DIR ({CHARTS_DIR}) at module level: {e}")
+CHARTS_URL_PREFIX = "/charts_data"
 
-# Initialize as empty; will be populated in initialize_analyzer
 tool_descriptions_for_llm = ""
 
 
-# --- Pydantic Model for Tool Selection ---
 class ToolSelection(BaseModel):
     tool_names: List[str] = Field(
         description="List of technical indicator tool names to be called (e.g., moving_averages, oscillators).")
 
 
-# --- Initialization and LLM Setup ---
 def initialize_analyzer():
-    """
-    Initializes global settings, checks API keys, and constructs tool descriptions.
-    Should be called once at application startup.
-    """
     global tool_descriptions_for_llm
-
     if not OPENAI_API_KEY:
         print(f"CRITICAL ERROR: The environment variable {ENV_OPENAI_API_KEY} is not set.")
         return False
-
     if LANGCHAIN_TRACING_V2 and LANGCHAIN_API_KEY and LANGCHAIN_ENDPOINT:
         os.environ[ENV_LANGCHAIN_TRACING_V2] = "true"
         os.environ[ENV_LANGCHAIN_ENDPOINT] = LANGCHAIN_ENDPOINT
@@ -89,11 +75,8 @@ def initialize_analyzer():
         print(f"LangSmith tracing enabled. Project: {LANGCHAIN_PROJECT}")
     else:
         print("LangSmith tracing is not configured or missing some required environment variables.")
-
-    # Construct tool_descriptions_for_llm here (ONLY FOR INDICATOR TOOLS)
     try:
         descriptions = []
-        # Iterate through the indicator tools ONLY
         for name, tool_func_obj in available_technical_indicator_tools.items():
             desc = getattr(tool_func_obj, 'description', None) or getattr(tool_func_obj, '__doc__', None)
             if desc:
@@ -102,53 +85,40 @@ def initialize_analyzer():
             else:
                 first_line_doc = f"Tool to calculate {name.replace('_', ' ')}."
             descriptions.append(f"- {name}: {first_line_doc}")
-
         tool_descriptions_for_llm = "\n".join(descriptions)
-
         if not tool_descriptions_for_llm:
-            print("Warning: tool_descriptions_for_llm is empty after initialization. Check tool definitions.")
+            print("Warning: tool_descriptions_for_llm is empty.")
         else:
             print("Indicator tool descriptions for LLM constructed successfully.")
     except Exception as e:
         print(f"ERROR: Failed to construct tool_descriptions_for_llm: {e}")
         tool_descriptions_for_llm = "Error: Could not load indicator tool descriptions."
-
     return True
 
 
 llm = None
 tool_selector_llm = None
-llm_pos_advice = None  # Separate instance for position advice with potentially different settings
+llm_pos_advice = None
+llm_symbol_resolver = None  # New LLM instance for symbol resolution
 
 
 def get_llms():
-    """Lazily initializes and returns the LLM instances."""
-    global llm, tool_selector_llm, llm_pos_advice
-    if llm is None:
-        llm = ChatOpenAI(
-            model=LLM_MODEL_NAME,
-            temperature=LLM_TEMPERATURE,
-            max_tokens=LLM_MAX_TOKENS  # Use reduced token limit for general summaries
+    global llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver
+    if llm is None: llm = ChatOpenAI(model=LLM_MODEL_NAME, temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS)
+    if tool_selector_llm is None: tool_selector_llm = ChatOpenAI(model=LLM_MODEL_NAME, temperature=0.2,
+                                                                 max_tokens=TOOL_SELECTOR_LLM_MAX_TOKENS)
+    if llm_pos_advice is None: llm_pos_advice = ChatOpenAI(model=LLM_MODEL_NAME, temperature=LLM_TEMPERATURE,
+                                                           max_tokens=POSITION_ADVICE_MAX_TOKENS)
+    if llm_symbol_resolver is None:
+        llm_symbol_resolver = ChatOpenAI(
+            model=LLM_SYMBOL_RESOLUTION_MODEL,
+            temperature=0.0,  # Low temperature for factual recall
+            max_tokens=50  # Ticker symbols are short
         )
-    if tool_selector_llm is None:
-        tool_selector_llm = ChatOpenAI(
-            model=LLM_MODEL_NAME,
-            temperature=0.2,
-            max_tokens=TOOL_SELECTOR_LLM_MAX_TOKENS
-        )
-    if llm_pos_advice is None:
-        llm_pos_advice = ChatOpenAI(
-            model=LLM_MODEL_NAME,
-            temperature=LLM_TEMPERATURE,  # Can use same temp or adjust
-            max_tokens=POSITION_ADVICE_MAX_TOKENS  # Allow more tokens for detailed levels
-        )
-    # Ensure all three are returned
-    return llm, tool_selector_llm, llm_pos_advice
+    return llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver
 
 
-# --- Helper Function for Sanitizing Indicator Tool Output ---
 def _sanitize_indicator_value(value: Any) -> Any:
-    """Converts indicator values (including Series, NaN) to JSON-serializable types."""
     if isinstance(value, pd.Series):
         if value.empty: return None
         if value.isna().all(): return None
@@ -162,10 +132,8 @@ def _sanitize_indicator_value(value: Any) -> Any:
     return value
 
 
-# --- Technical Indicator Tools (Async) ---
-# (Tools remain the same as previous version - calculate_moving_averages, calculate_oscillators, calculate_volatility_indicators)
 @tool
-async def calculate_moving_averages(data_json: str) -> Dict[str, Optional[Any]]:  # Return type changed to Any
+async def calculate_moving_averages(data_json: str) -> Dict[str, Optional[Any]]:
     """
     Calculates Simple Moving Averages (SMA 20, 50, 200) and Exponential Moving Averages (EMA 12, 26)
     for the provided stock data. Input data_json is a JSON string of a pandas DataFrame (orient='split').
@@ -195,7 +163,7 @@ async def calculate_moving_averages(data_json: str) -> Dict[str, Optional[Any]]:
 
 
 @tool
-async def calculate_oscillators(data_json: str) -> Dict[str, Optional[Any]]:  # Return type changed to Any
+async def calculate_oscillators(data_json: str) -> Dict[str, Optional[Any]]:
     """
     Calculates MACD (Moving Average Convergence Divergence) and RSI (Relative Strength Index).
     Input data_json is a JSON string of a pandas DataFrame (orient='split').
@@ -230,7 +198,7 @@ async def calculate_oscillators(data_json: str) -> Dict[str, Optional[Any]]:  # 
 
 
 @tool
-async def calculate_volatility_indicators(data_json: str) -> Dict[str, Optional[Any]]:  # Return type changed to Any
+async def calculate_volatility_indicators(data_json: str) -> Dict[str, Optional[Any]]:
     """
     Calculates Bollinger Bands (High, Low, Moving Average).
     Input data_json is a JSON string of a pandas DataFrame (orient='split').
@@ -266,118 +234,14 @@ available_technical_indicator_tools = {
 
 
 # --- Chart Generation Function (Internal Helper, Not a Tool) ---
-def _generate_chart_with_indicators(daily_data_json: str, daily_indicators: Dict[str, Dict], stock_symbol: str) -> Dict[
-    str, Optional[str]]:
-    # (Chart generation logic remains the same)
-    try:
-        df = pd.read_json(StringIO(daily_data_json), orient='split')
-        if df.empty or 'Close' not in df.columns: return {"error": "Invalid daily data for chart"}
-        if not isinstance(df.index, pd.DatetimeIndex):
-            try:
-                df.index = pd.to_datetime(df.index)
-            except Exception:
-                return {"error": "Chart data index cannot be datetime"}
-        plt.style.use('seaborn-v0_8-darkgrid')
-        subplots = 1
-        has_rsi = 'oscillators' in daily_indicators and daily_indicators['oscillators'].get('rsi_series')
-        has_macd = 'oscillators' in daily_indicators and daily_indicators['oscillators'].get('macd_series')
-        if has_rsi: subplots += 1
-        if has_macd: subplots += 1
-        fig, axes = plt.subplots(subplots, 1, figsize=(12, 3 * subplots), sharex=True,
-                                 gridspec_kw={'height_ratios': [3] + [1] * (subplots - 1)})
-        if subplots == 1: axes = [axes]
-        main_ax = axes[0];
-        current_ax_index = 1
-        main_ax.plot(df.index, df['Close'], label='Close Price', color='black', linewidth=1.0)
-        ma_results = daily_indicators.get('moving_averages', {})
-        if ma_results and not ma_results.get("error"):
-            for key, color, label in [('sma_20_series', 'orange', 'SMA 20'), ('sma_50_series', 'dodgerblue', 'SMA 50'),
-                                      ('sma_200_series', 'red', 'SMA 200')]:
-                series_json = ma_results.get(key)
-                if series_json:
-                    series = pd.read_json(StringIO(series_json), orient='split', typ='series')
-                    if not series.empty: main_ax.plot(series.index, series, label=label, color=color, linewidth=0.8,
-                                                      alpha=0.8)
-        bb_results = daily_indicators.get('volatility', {})
-        if bb_results and not bb_results.get("error"):
-            bb_high_json = bb_results.get('bb_high_series');
-            bb_low_json = bb_results.get('bb_low_series');
-            bb_ma_json = bb_results.get('bb_ma_series')
-            if bb_high_json and bb_low_json and bb_ma_json:
-                bb_high = pd.read_json(StringIO(bb_high_json), orient='split', typ='series');
-                bb_low = pd.read_json(StringIO(bb_low_json), orient='split', typ='series');
-                bb_ma = pd.read_json(StringIO(bb_ma_json), orient='split', typ='series')
-                if not bb_high.empty and not bb_low.empty:
-                    main_ax.plot(bb_ma.index, bb_ma, label='BB MA', color='grey', linestyle='--', linewidth=0.7,
-                                 alpha=0.7)
-                    main_ax.plot(bb_high.index, bb_high, label='BB Upper', color='grey', linestyle=':', linewidth=0.7,
-                                 alpha=0.7)
-                    main_ax.plot(bb_low.index, bb_low, label='BB Lower', color='grey', linestyle=':', linewidth=0.7,
-                                 alpha=0.7)
-                    main_ax.fill_between(bb_high.index, bb_low, bb_high, color='grey', alpha=0.1)
-        main_ax.set_title(f'{stock_symbol} Analysis Chart', fontsize=14);
-        main_ax.set_ylabel('Price', fontsize=10)
-        main_ax.tick_params(axis='y', labelsize=8);
-        main_ax.legend(fontsize='small', loc='upper left');
-        main_ax.grid(True, linestyle='--', alpha=0.6)
-        osc_results = daily_indicators.get('oscillators', {})
-        if has_rsi and osc_results and not osc_results.get("error"):
-            rsi_json = osc_results.get('rsi_series')
-            if rsi_json:
-                rsi_ax = axes[current_ax_index]
-                rsi_series = pd.read_json(StringIO(rsi_json), orient='split', typ='series')
-                if not rsi_series.empty:
-                    rsi_ax.plot(rsi_series.index, rsi_series, label='RSI', color='purple', linewidth=0.8)
-                    rsi_ax.axhline(70, color='red', linestyle='--', linewidth=0.5, alpha=0.7);
-                    rsi_ax.axhline(30, color='green', linestyle='--', linewidth=0.5, alpha=0.7)
-                    rsi_ax.fill_between(rsi_series.index, 70, 30, color='purple', alpha=0.05)
-                    rsi_ax.set_ylim(0, 100);
-                    rsi_ax.set_ylabel('RSI', fontsize=9);
-                    rsi_ax.tick_params(axis='y', labelsize=8);
-                    rsi_ax.grid(True, linestyle='--', alpha=0.5)
-                    current_ax_index += 1
-        if has_macd and osc_results and not osc_results.get("error"):
-            macd_json = osc_results.get('macd_series');
-            signal_json = osc_results.get('macd_signal_series');
-            hist_json = osc_results.get('macd_hist_series')
-            if macd_json and signal_json and hist_json:
-                macd_ax = axes[current_ax_index]
-                macd_series = pd.read_json(StringIO(macd_json), orient='split', typ='series');
-                signal_series = pd.read_json(StringIO(signal_json), orient='split', typ='series');
-                hist_series = pd.read_json(StringIO(hist_json), orient='split', typ='series')
-                if not macd_series.empty:
-                    macd_ax.plot(macd_series.index, macd_series, label='MACD', color='blue', linewidth=0.8)
-                    macd_ax.plot(signal_series.index, signal_series, label='Signal', color='red', linestyle='--',
-                                 linewidth=0.8)
-                    colors = ['g' if v >= 0 else 'r' for v in hist_series]
-                    macd_ax.bar(hist_series.index, hist_series, label='Histogram', color=colors, alpha=0.5, width=0.7)
-                    macd_ax.axhline(0, color='grey', linestyle='-', linewidth=0.5)
-                    macd_ax.set_ylabel('MACD', fontsize=9);
-                    macd_ax.tick_params(axis='y', labelsize=8);
-                    macd_ax.legend(fontsize='small', loc='upper left');
-                    macd_ax.grid(True, linestyle='--', alpha=0.5)
-                    current_ax_index += 1
-        plt.xticks(rotation=30, ha='right', fontsize=8)
-        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%b %d, %Y'))
-        axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-        fig.align_ylabels(axes);
-        fig.tight_layout(h_pad=1.5)
-        filename = f"{stock_symbol.replace('.', '_')}_chart_{uuid.uuid4().hex[:8]}.png"
-        filepath = os.path.join(CHARTS_DIR, filename)
-        plt.savefig(filepath, dpi=120);
-        plt.close(fig)
-        chart_url = f"{CHARTS_URL_PREFIX}/{filename}"
-        print(f"LOG: Combined chart generated: {filepath}, URL: {chart_url}")
-        return {"chart_url": chart_url}
-    except Exception as e:
-        print(f"ERROR generating combined chart: {e}")
-        if 'fig' in locals() and plt.fignum_exists(fig.number): plt.close(fig)
-        return {"error": f"Failed to generate combined chart: {str(e)}"}
+# def _generate_chart_with_indicators(daily_data_json: str, daily_indicators: Dict[str, Dict], stock_symbol: str) -> Dict[str, Optional[str]]:
+#     # ... chart generation logic ...
+#     pass
+#     return {"error": "Chart generation is currently disabled."}
 
 
 # --- Helper Functions (Data Fetching & Summaries - Async LLM Calls) ---
 def sanitize_value(value: Any) -> Any:
-    """Recursively sanitizes data for JSON serialization."""
     if isinstance(value, pd.Timestamp): return value.isoformat()
     if isinstance(value, (np.datetime64, np.timedelta64)): return str(value)
     if isinstance(value, np.generic): return value.item()
@@ -388,41 +252,52 @@ def sanitize_value(value: Any) -> Any:
     return value
 
 
+async def _is_valid_ticker_async(ticker_symbol: str) -> bool:
+    """Asynchronously checks if a ticker symbol is valid by fetching its info."""
+    try:
+        loop = asyncio.get_event_loop()
+        stock_info = await loop.run_in_executor(None, lambda t: yf.Ticker(t).info, ticker_symbol)
+        return bool(stock_info and (stock_info.get('regularMarketPrice') is not None or stock_info.get('shortName')))
+    except Exception as e:
+        print(f"LOG: Validation check failed for {ticker_symbol}: {e}")
+        return False
+
+
 async def fetch_stock_data_yf_async(ticker_symbol: str):
-    """Asynchronously fetches stock data using yfinance via thread pool."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, fetch_stock_data_yf_sync, ticker_symbol)
 
 
 def fetch_stock_data_yf_sync(ticker_symbol: str):
-    """Synchronous helper to fetch data using yfinance, includes validation."""
+    """Synchronous helper to fetch data using yfinance. Assumes ticker_symbol is already validated."""
     stock = yf.Ticker(ticker_symbol)
     info = stock.info
-    if not info or info.get('regularMarketPrice') is None:
-        if not ticker_symbol.endswith(".NS") and not '.' in ticker_symbol:
-            print(f"LOG: Info fetch failed for {ticker_symbol}, trying with .NS suffix.")
-            stock_ns = yf.Ticker(f"{ticker_symbol}.NS")
-            info_ns = stock_ns.info
-            if info_ns and info_ns.get('regularMarketPrice') is not None:
-                print(f"LOG: Found valid data for {ticker_symbol}.NS.")
-                stock = stock_ns
-                info = info_ns
-                ticker_symbol = f"{ticker_symbol}.NS"
-            else:
-                print(f"LOG: Still no valid data found for {ticker_symbol}.NS.")
-                raise ValueError(f"Could not find valid stock info for '{ticker_symbol}' or '{ticker_symbol}.NS'")
-        else:
-            raise ValueError(f"Could not find valid stock info for '{ticker_symbol}'")
+    # This was part of the old resolve_symbol node. Now fetch_stock_data_yf_sync assumes a valid ticker.
+    # If info is still None after yf.Ticker(valid_ticker).info, then it's truly no info.
+    if not info:
+        print(f"Warning: No info dictionary returned by yfinance for already validated ticker '{ticker_symbol}'.")
+        # raise ValueError(f"Could not retrieve info for validated ticker '{ticker_symbol}'.") # Or handle as warning
 
-    return {"resolved_symbol": ticker_symbol, "info": info or {}, "daily": stock.history(period="1y"),
-            "weekly": stock.history(period="5y", interval="1wk"),
-            "monthly": stock.history(period="max", interval="1mo"), "financials": stock.financials,
-            "balance_sheet": stock.balance_sheet, "cashflow": stock.cashflow, }
+    daily_data = stock.history(period="1y")
+    if daily_data.empty:
+        # This could happen if a ticker is valid (e.g., exists) but has no recent trading data.
+        print(f"Warning: No daily historical data found for ticker '{ticker_symbol}'.")
+        # Depending on requirements, this could be an error or just a state to note.
+
+    return {
+        "resolved_symbol": ticker_symbol,
+        "info": info or {},  # Ensure info is dict
+        "daily": daily_data,
+        "weekly": stock.history(period="5y", interval="1wk"),
+        "monthly": stock.history(period="max", interval="1mo"),
+        "financials": stock.financials,
+        "balance_sheet": stock.balance_sheet,
+        "cashflow": stock.cashflow,
+    }
 
 
 async def get_technical_analysis_summary_content(stock_symbol: str, executed_indicators: Dict[str, Dict[str, Dict]]):
-    """Generates TA summary using LLM based on executed indicators."""
-    current_llm, _, _ = get_llms()
+    current_llm, _, _, _ = get_llms()
     prompt_parts = [
         f"Analyze the technical outlook for {stock_symbol} based ONLY on the following calculated indicator values."]
     prompt_parts.append(
@@ -460,8 +335,7 @@ async def get_technical_analysis_summary_content(stock_symbol: str, executed_ind
 async def get_fundamental_analysis_summary_content(stock_symbol: str, stock_info_json: str,
                                                    financials_json: Optional[str], balance_sheet_json: Optional[str],
                                                    cashflow_json: Optional[str]):
-    """Generates FA summary using LLM."""
-    current_llm, _, _ = get_llms()
+    current_llm, _, _, _ = get_llms()
     stock_info = json.loads(stock_info_json) if stock_info_json else {}
     financials = pd.read_json(StringIO(financials_json), orient='split') if financials_json else pd.DataFrame()
     balance_sheet = pd.read_json(StringIO(balance_sheet_json), orient='split') if balance_sheet_json else pd.DataFrame()
@@ -493,17 +367,13 @@ async def get_fundamental_analysis_summary_content(stock_symbol: str, stock_info
 
 async def generate_recommendation_content(stock_symbol: str, ta_summary: str, fa_summary: str,
                                           user_question: Optional[str]):
-    """Generates overall recommendation using LLM, addressing user question first."""
-    current_llm, _, _ = get_llms()
+    current_llm, _, _, _ = get_llms()
     default_question = "What is the overall recommendation (Buy, Sell, Hold) for this stock considering a medium-term investment horizon (6-12 months)?"
-    is_specific_question = bool(user_question) and user_question != default_question
-
-    # Construct prompt with conditional instruction for user question
+    is_specific_question = bool(user_question) and user_question.lower().strip() != default_question.lower().strip()
     prompt_parts = [f"Stock: {stock_symbol}"]
-    if is_specific_question:
-        prompt_parts.append(f"User Question: {user_question}")
-    prompt_parts.append(f"Technical Analysis Summary:\n{ta_summary}")
-    prompt_parts.append(f"Fundamental Analysis Summary:\n{fa_summary}")
+    if is_specific_question: prompt_parts.append(f"User Question: {user_question}")
+    prompt_parts.append(f"Technical Analysis Summary:\n{ta_summary}");
+    prompt_parts.append(f"Fundamental Analysis Summary:\n{fa_summary}");
     prompt_parts.append("\nInstructions:")
     if is_specific_question:
         prompt_parts.append(
@@ -513,21 +383,16 @@ async def generate_recommendation_content(stock_symbol: str, ta_summary: str, fa
     else:
         prompt_parts.append("1. Provide the overall recommendation (Buy/Sell/Hold).")
         prompt_parts.append("2. List ONLY 2-3 main bullet points justifying the recommendation.")
-    prompt_parts.append(f"Be extremely concise. STRICTLY ADHERE to the {LLM_MAX_TOKENS} token limit.")
+    prompt_parts.append(f"Be extremely concise. STRICTLY ADHERE to the {LLM_MAX_TOKENS} token limit.");
     prompt_parts.append("\nResponse:")
-
     prompt = "\n".join(prompt_parts)
-
-    # print(f"\nDEBUG RECOMMENDATION PROMPT:\n{prompt}\n") # Uncomment for debugging
-
     response = await current_llm.ainvoke(prompt)
     return response.content
 
 
 async def generate_position_advice_content(stock_symbol: str, recommendation: str, user_position: dict,
                                            key_levels: Dict):
-    """Generates position-specific advice using LLM, including support/stop-loss levels."""
-    _, _, current_llm_pos_advice = get_llms()
+    _, _, current_llm_pos_advice, _ = get_llms()
     if not user_position or not user_position.get("shares") or not user_position.get(
         "avg_price"): return "No position information provided or incomplete information."
     shares = user_position["shares"];
@@ -573,10 +438,10 @@ class StockAnalysisState(TypedDict):
     stock_financials_json: Optional[str]
     stock_balance_sheet_json: Optional[str]
     stock_cashflow_json: Optional[str]
-    selected_technical_tools: Optional[List[str]]  # Now only indicator tools
-    executed_technical_indicators: Optional[Dict[str, Dict[str, Dict]]]  # Includes series data
+    selected_technical_tools: Optional[List[str]]
+    executed_technical_indicators: Optional[Dict[str, Dict[str, Dict]]]
     generated_chart_urls: Optional[List[str]]
-    key_technical_levels: Optional[Dict[str, Optional[float]]]  # NEW: To pass key levels to advice node
+    key_technical_levels: Optional[Dict[str, Optional[float]]]
     technical_analysis_summary: Optional[str]
     fundamental_analysis_summary: Optional[str]
     final_recommendation: Optional[str]
@@ -585,14 +450,13 @@ class StockAnalysisState(TypedDict):
 
 # --- LangGraph Nodes (Async) ---
 async def start_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Initializes the state for a new analysis request."""
     print(f"LOG: Start node for query: {state['user_stock_query']}")
     state["error_message"] = ""
     state["stock_symbol"] = None
     state["selected_technical_tools"] = []
     state["executed_technical_indicators"] = {}
     state["generated_chart_urls"] = []
-    state["key_technical_levels"] = {}  # Initialize key levels dict
+    state["key_technical_levels"] = {}
     state["raw_stock_data_json"] = {"daily": None, "weekly": None, "monthly": None}
     state["stock_info_json"] = None
     state["stock_financials_json"] = None
@@ -606,60 +470,97 @@ async def start_node(state: StockAnalysisState) -> StockAnalysisState:
 
 
 async def resolve_stock_symbol_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Attempts to resolve the user's stock query to a valid yfinance ticker symbol."""
-    # (resolve_stock_symbol_node logic remains the same)
-    print(f"LOG: Resolve symbol node for query: {state['user_stock_query']}")
-    user_query = state["user_stock_query"].strip().upper()
-    resolved_symbol = None;
+    """
+    Attempts to resolve the user's stock query to a valid yfinance ticker symbol
+    using an LLM and fallback heuristics.
+    """
+    print(f"LOG: Resolve symbol node for query: '{state['user_stock_query']}'")
+    user_query_original = state["user_stock_query"]
+    user_query_upper = user_query_original.strip().upper()
+
+    _, _, _, current_llm_resolver = get_llms()  # Get the symbol resolver LLM
+    resolved_symbol = None
     error_msg = ""
 
-    async def is_valid_ticker(ticker):
-        try:
-            loop = asyncio.get_event_loop()
-            stock_info = await loop.run_in_executor(None, lambda t: yf.Ticker(t).info, ticker)
-            return stock_info and stock_info.get('regularMarketPrice') is not None
-        except Exception as e:
-            print(f"LOG: Validation check failed for {ticker}: {e}"); return False
+    # 1. Attempt resolution with LLM
+    try:
+        print(f"LOG: Attempting LLM based symbol resolution for '{user_query_original}'...")
+        # Simple prompt for ticker suggestion
+        # You can make this more sophisticated with examples or specific instructions
+        # about common exchanges (NYSE, NASDAQ, NSE for India etc.)
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are an expert financial assistant. Your task is to identify the most likely official stock ticker symbol based on the user's query. "
+             "If the company sounds Indian (e.g., Reliance, Infosys, Tata, HDFC), append '.NS' to the suggested symbol. "
+             "For well-known international companies (e.g., Apple, Microsoft, Google), provide their common US exchange ticker. "
+             "If the query is already a valid-looking ticker, return it as is. "
+             "If highly ambiguous or unclear, return 'UNKNOWN'. "
+             "Respond with ONLY the ticker symbol or 'UNKNOWN'."),
+            ("human", "User query: {query}")
+        ])
 
-    if re.match(r"^[A-Z0-9.-]+$", user_query):
-        print(f"LOG: Query '{user_query}' looks like a ticker. Validating...")
-        if await is_valid_ticker(user_query):
-            resolved_symbol = user_query; print(f"LOG: Direct query '{user_query}' validated.")
-        else:
-            print(f"LOG: Direct query '{user_query}' failed validation.")
-            if '.' not in user_query:
-                query_ns = f"{user_query}.NS";
-                print(f"LOG: Trying '{query_ns}'...")
-                if await is_valid_ticker(query_ns):
-                    resolved_symbol = query_ns; print(f"LOG: Query '{query_ns}' validated.")
-                else:
-                    error_msg = f"Could not validate '{user_query}' or '{query_ns}'. "
+        # Create a simple chain for this
+        resolve_chain = prompt_template | current_llm_resolver | StrOutputParser()
+        llm_suggested_ticker = await resolve_chain.ainvoke({"query": user_query_original})
+        llm_suggested_ticker = llm_suggested_ticker.strip().upper()
+        print(f"LOG: LLM suggested ticker: '{llm_suggested_ticker}'")
+
+        if llm_suggested_ticker and llm_suggested_ticker != "UNKNOWN":
+            if await _is_valid_ticker_async(llm_suggested_ticker):
+                resolved_symbol = llm_suggested_ticker
+                print(f"LOG: LLM suggested ticker '{resolved_symbol}' validated.")
             else:
-                error_msg = f"Could not validate ticker '{user_query}'. "
-    if not resolved_symbol and '.' not in user_query:
-        query_ns = f"{user_query}.NS";
-        print(f"LOG: Trying '{query_ns}' as fallback...")
-        if await is_valid_ticker(query_ns):
-            resolved_symbol = query_ns; print(
-                f"LOG: Resolved '{user_query}' to '{resolved_symbol}' based on .NS check.")
+                print(f"LOG: LLM suggested ticker '{llm_suggested_ticker}' was NOT valid.")
+                error_msg += f"LLM suggestion '{llm_suggested_ticker}' was not a valid ticker. "
         else:
-            error_msg += f"Could not resolve '{user_query}' to a valid symbol (tried direct and with .NS)."; print(
-                f"LOG: Failed to resolve '{user_query}' even with .NS suffix.")
+            print("LOG: LLM could not suggest a ticker or returned UNKNOWN.")
+            error_msg += "LLM could not confidently resolve the stock name. "
+
+    except Exception as e:
+        print(f"ERROR: Exception during LLM symbol resolution: {e}")
+        error_msg += "Error during LLM symbol resolution. "
+
+    # 2. Fallback to heuristic if LLM fails or suggestion is invalid
+    if not resolved_symbol:
+        print(f"LOG: LLM resolution failed or invalid. Falling back to heuristics for '{user_query_original}'...")
+        potential_symbols_to_try = []
+        if re.match(r"^[A-Z0-9.-]+$", user_query_upper) and ('.' in user_query_upper or len(user_query_upper) <= 5):
+            potential_symbols_to_try.append(user_query_upper)
+        if not '.' in user_query_upper and re.match(r"^[A-Z\s]+$", user_query_upper):
+            potential_symbols_to_try.append(f"{user_query_upper.replace(' ', '')}.NS")
+        if user_query_upper not in potential_symbols_to_try:
+            potential_symbols_to_try.append(user_query_upper)
+        if ' ' not in user_query_upper and '.' not in user_query_upper and not user_query_upper.endswith(".NS"):
+            potential_symbols_to_try.append(f"{user_query_upper}.NS")
+
+        unique_symbols_to_try = list(dict.fromkeys(potential_symbols_to_try))
+        print(f"LOG: Heuristic: Potential symbols to try: {unique_symbols_to_try}")
+
+        for symbol_attempt in unique_symbols_to_try:
+            if await _is_valid_ticker_async(symbol_attempt):
+                resolved_symbol = symbol_attempt
+                print(f"LOG: Heuristic resolved '{user_query_original}' to '{resolved_symbol}'")
+                error_msg = ""  # Clear previous error if heuristic succeeds
+                break
+            else:
+                print(f"LOG: Heuristic: '{symbol_attempt}' is not valid.")
+
     if resolved_symbol:
         state["stock_symbol"] = resolved_symbol
     else:
-        state["error_message"] = (state.get("error_message", "") + error_msg).strip();
-    if not resolved_symbol and not state["error_message"]: state[
-        "error_message"] = f"Could not resolve '{user_query}' to a known stock symbol."
+        final_error = error_msg if error_msg else f"Could not resolve '{user_query_original}' to a known stock symbol."
+        state["error_message"] = (state.get("error_message", "") + final_error).strip()
+        print(f"LOG: Failed to resolve symbol for '{user_query_original}'. Final error: {state['error_message']}")
+
     return state
 
 
 async def fetch_data_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Fetches data using the resolved symbol, handles potential errors."""
-    # (fetch_data_node logic remains the same)
     resolved_symbol = state.get("stock_symbol")
-    if state["error_message"] or not resolved_symbol: state["error_message"] = (
-                state.get("error_message", "") + " Skipping data fetch.").strip(); return state
+    if state["error_message"] or not resolved_symbol:
+        state["error_message"] = (state.get("error_message",
+                                            "") + " Skipping data fetch due to unresolved symbol or prior error.").strip()
+        return state
     print(f"LOG: Fetch data node for resolved symbol: {resolved_symbol}")
     try:
         fetched_data = await fetch_stock_data_yf_async(resolved_symbol)
@@ -681,23 +582,25 @@ async def fetch_data_node(state: StockAnalysisState) -> StockAnalysisState:
         state["stock_cashflow_json"] = fetched_data.get("cashflow").to_json(orient='split',
                                                                             date_format='iso') if fetched_data.get(
             "cashflow") is not None and not fetched_data.get("cashflow").empty else None
-        if not state["raw_stock_data_json"]["daily"] and not state["raw_stock_data_json"]["weekly"] and not \
-        state["raw_stock_data_json"]["monthly"]: raise ValueError(
-            f"All historical price dataframes are empty or None for {state['stock_symbol']}.")
+        if not state["raw_stock_data_json"]["daily"]:
+            print(
+                f"Warning: Daily historical price data is empty for {state['stock_symbol']}. Some features might be affected.")
+            if not state["raw_stock_data_json"]["weekly"] and not state["raw_stock_data_json"]["monthly"]:
+                # If all historical data is missing, this becomes a more significant issue.
+                state["error_message"] = (state.get("error_message",
+                                                    "") + f" All historical price data is missing for {state['stock_symbol']}. Analysis will be limited. ").strip()
         print(f"LOG: Successfully fetched and serialized data for {state['stock_symbol']}.")
     except Exception as e:
-        print(f"ERROR in fetch_data_node for {resolved_symbol}: {e}"); state["error_message"] = (
-                    state.get("error_message",
-                              "") + f" Failed to fetch/serialize data for {resolved_symbol}: {str(e)}. ").strip()
+        print(f"ERROR in fetch_data_node for {resolved_symbol}: {e}")
+        state["error_message"] = (state.get("error_message",
+                                            "") + f" Failed to fetch/serialize data for {resolved_symbol}: {str(e)}. ").strip()
     return state
 
 
 async def select_technical_tools_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Selects INDICATOR tools based on user query."""
-    # (Logic remains the same)
     global tool_descriptions_for_llm
     print(f"LOG: Select technical INDICATOR tools node for {state['stock_symbol']}")
-    _, current_tool_selector_llm, _ = get_llms()
+    _, current_tool_selector_llm, _, _ = get_llms()
     if not tool_descriptions_for_llm or "Error:" in tool_descriptions_for_llm:
         state["error_message"] += "Critical error: Indicator tool descriptions not available. Defaulting. "
         state["selected_technical_tools"] = list(available_technical_indicator_tools.keys())
@@ -728,8 +631,6 @@ async def select_technical_tools_node(state: StockAnalysisState) -> StockAnalysi
 
 
 async def execute_technical_tools_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Executes the selected INDICATOR tools concurrently and extracts key levels."""
-    # (Logic remains the same)
     print(f"LOG: Execute technical INDICATOR tools node for {state['stock_symbol']}")
     if state["error_message"] or not state["selected_technical_tools"] or not state["raw_stock_data_json"]:
         state["error_message"] += "Skipped technical indicator tool execution. "
@@ -743,7 +644,6 @@ async def execute_technical_tools_node(state: StockAnalysisState) -> StockAnalys
     raw_data_map = state["raw_stock_data_json"]
     indicator_results = {"daily": {}, "weekly": {}, "monthly": {}}
     tool_invocations = []
-
     for timeframe in ["daily", "weekly", "monthly"]:
         df_json_str = raw_data_map.get(timeframe)
         if not df_json_str:
@@ -756,11 +656,9 @@ async def execute_technical_tools_node(state: StockAnalysisState) -> StockAnalys
                 tool_invocations.append((timeframe, tool_name, tool_func.ainvoke({"data_json": df_json_str})))
             else:
                 indicator_results[timeframe][tool_name] = {"error": "Indicator tool function not found."}
-
     gathered_results = await asyncio.gather(*(inv[2] for inv in tool_invocations), return_exceptions=True)
     result_index = 0
-    key_levels = {}  # Dictionary to store key levels for position advice
-
+    key_levels = {}
     for timeframe, tool_name, _ in tool_invocations:
         current_result = gathered_results[result_index]
         if isinstance(current_result, Exception):
@@ -777,53 +675,18 @@ async def execute_technical_tools_node(state: StockAnalysisState) -> StockAnalys
                 elif tool_name == 'volatility':
                     key_levels['bb_low'] = current_result.get('bb_low')
         result_index += 1
-
     state["executed_technical_indicators"] = indicator_results
     state["key_technical_levels"] = {k: v for k, v in key_levels.items() if v is not None}
-
     return state
 
 
 async def generate_chart_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Generates the combined chart if daily data and indicators are available."""
-    # (Logic remains the same)
-    print(f"LOG: Generate chart node for {state['stock_symbol']}")
-    if state["error_message"]:
-        print("LOG: Skipping chart generation due to prior error.")
-        state["generated_chart_urls"] = ["Chart generation skipped due to prior error."]
-        return state
-    daily_data_json = state.get("raw_stock_data_json", {}).get("daily")
-    daily_indicators = state.get("executed_technical_indicators", {}).get("daily", {})
-    stock_symbol = state.get("stock_symbol", "Unknown")
-    if not daily_data_json:
-        print("LOG: Skipping chart generation, no daily data.")
-        state["generated_chart_urls"] = ["Chart not generated: Missing daily data."]
-        return state
-    if not daily_indicators:
-        print("LOG: Skipping chart generation, no calculated daily indicators.")
-        state["generated_chart_urls"] = ["Chart not generated: Missing calculated indicators."]
-        return state
-    try:
-        loop = asyncio.get_event_loop()
-        chart_result = await loop.run_in_executor(None, _generate_chart_with_indicators, daily_data_json,
-                                                  daily_indicators, stock_symbol)
-        if chart_result.get("chart_url"):
-            state["generated_chart_urls"] = [chart_result["chart_url"]]
-        else:
-            error_msg = chart_result.get("error", "Unknown chart generation error")
-            state["generated_chart_urls"] = [f"Error generating chart: {error_msg}"]
-            state["error_message"] = (
-                        state.get("error_message", "") + f" Chart generation failed: {error_msg}. ").strip()
-    except Exception as e:
-        print(f"ERROR in generate_chart_node: {e}")
-        state["error_message"] = (state.get("error_message", "") + f" Chart generation node failed: {str(e)}. ").strip()
-        state["generated_chart_urls"] = [f"Error generating chart: {str(e)}"]
+    print(f"LOG: Generate chart node for {state['stock_symbol']} (currently disabled by user request)")
+    state["generated_chart_urls"] = ["Chart generation is currently disabled."]
     return state
 
 
 async def summarize_technical_analysis_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Generates TA summary if indicators are available."""
-    # (Logic remains the same)
     print(f"LOG: Summarize TA node for {state['stock_symbol']}")
     indicators = state.get("executed_technical_indicators")
     if state["error_message"] and not indicators: state[
@@ -841,8 +704,6 @@ async def summarize_technical_analysis_node(state: StockAnalysisState) -> StockA
 
 
 async def fundamental_analysis_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Performs FA if stock info is available."""
-    # (Logic remains the same)
     print(f"LOG: Fundamental analysis node for {state['stock_symbol']}")
     if state["error_message"] or not state.get("stock_info_json"): state["error_message"] += "Skipped FA. "; state[
         "fundamental_analysis_summary"] = "FA skipped."; return state
@@ -862,8 +723,6 @@ async def fundamental_analysis_node(state: StockAnalysisState) -> StockAnalysisS
 
 
 async def recommendation_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Generates recommendation if analysis summaries are available."""
-    # (Logic updated to pass user_question correctly)
     print(f"LOG: Recommendation node for {state['stock_symbol']}")
     ta_summary = state.get("technical_analysis_summary", "TA info N/A.")
     fa_summary = state.get("fundamental_analysis_summary", "FA info N/A.")
@@ -876,7 +735,7 @@ async def recommendation_node(state: StockAnalysisState) -> StockAnalysisState:
             state["stock_symbol"],
             ta_summary,
             fa_summary,
-            state.get("user_question")  # Pass the original user question here
+            state.get("user_question")
         )
     except Exception as e:
         print(f"ERROR in recommendation_node: {e}")
@@ -886,8 +745,6 @@ async def recommendation_node(state: StockAnalysisState) -> StockAnalysisState:
 
 
 async def position_advice_node(state: StockAnalysisState) -> StockAnalysisState:
-    """Generates position advice if recommendation and position exist."""
-    # (Logic remains the same)
     print(f"LOG: Position advice node for {state['stock_symbol']}")
     final_rec = state.get("final_recommendation", "")
     key_levels = state.get("key_technical_levels", {})
@@ -907,7 +764,6 @@ async def position_advice_node(state: StockAnalysisState) -> StockAnalysisState:
 
 # --- Compile LangGraph App ---
 def get_stock_analyzer_app():
-    """Compiles and returns the LangGraph application."""
     get_llms()
     workflow = StateGraph(StockAnalysisState)
     workflow.add_node("start", start_node)
@@ -915,7 +771,7 @@ def get_stock_analyzer_app():
     workflow.add_node("fetch_data", fetch_data_node)
     workflow.add_node("select_technical_tools", select_technical_tools_node)
     workflow.add_node("execute_technical_tools", execute_technical_tools_node)
-    workflow.add_node("generate_chart", generate_chart_node)
+    # workflow.add_node("generate_chart", generate_chart_node) # Chart node commented out
     workflow.add_node("summarize_technical_analysis", summarize_technical_analysis_node)
     workflow.add_node("fundamental_analysis", fundamental_analysis_node)
     workflow.add_node("generate_recommendation", recommendation_node)
@@ -926,8 +782,9 @@ def get_stock_analyzer_app():
     workflow.add_edge("resolve_symbol", "fetch_data")
     workflow.add_edge("fetch_data", "select_technical_tools")
     workflow.add_edge("select_technical_tools", "execute_technical_tools")
-    workflow.add_edge("execute_technical_tools", "generate_chart")
-    workflow.add_edge("generate_chart", "summarize_technical_analysis")
+    # workflow.add_edge("execute_technical_tools", "generate_chart")
+    # workflow.add_edge("generate_chart", "summarize_technical_analysis")
+    workflow.add_edge("execute_technical_tools", "summarize_technical_analysis")
     workflow.add_edge("summarize_technical_analysis", "fundamental_analysis")
     workflow.add_edge("fundamental_analysis", "generate_recommendation")
     workflow.add_edge("generate_recommendation", "generate_position_advice")
@@ -935,13 +792,11 @@ def get_stock_analyzer_app():
     return workflow.compile()
 
 
-# --- Standalone Testing ---
 async def main_test():
-    """Runs a test invocation of the analyzer if the script is executed directly."""
     if initialize_analyzer():
         app = get_stock_analyzer_app()
         print("Stock Analyzer App compiled for standalone async testing.")
-        inputs = {"user_stock_query": "Infosys", "user_question": "Should I buy more INFY now?",
+        inputs = {"user_stock_query": "Infosys", "user_question": "General analysis",
                   "user_position": {"shares": 10, "avg_price": 1400}}
         try:
             result_state = await app.ainvoke(inputs)

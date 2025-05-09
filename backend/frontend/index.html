@@ -6,7 +6,6 @@
     <title>AI Stock Analyzer Chat</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* (Styles remain the same) */
         #chatMessages::-webkit-scrollbar { width: 8px; }
         #chatMessages::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
         #chatMessages::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
@@ -19,6 +18,20 @@
         .bot-bubble img { max-width: 100%; height: auto; border-radius: 0.5rem; margin-top: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin: 0 auto; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Styles for collapsible input area */
+        .input-area-collapsed {
+            max-height: 0;
+            overflow: hidden;
+            padding-top: 0;
+            padding-bottom: 0;
+            border-top-width: 0;
+            transition: max-height 0.3s ease-out, padding 0.3s ease-out, border-width 0.3s ease-out;
+        }
+        .input-area-expanded {
+            max-height: 500px; /* Adjust as needed to fit content */
+            transition: max-height 0.5s ease-in;
+        }
     </style>
 </head>
 <body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen font-sans">
@@ -38,94 +51,115 @@
             <div class="loader inline-block"></div>
             <p class="text-sm text-gray-600 mt-2">Analyzing, please wait...</p>
         </div>
-        <form id="chatForm" class="p-4 border-t border-gray-200 bg-gray-50 rounded-b-lg">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
-                <div>
-                    <label for="userStockQuery" class="block text-sm font-medium text-gray-700 mb-1">Company Name or Symbol</label>
-                    <input type="text" id="userStockQuery" name="userStockQuery" required
-                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
-                           placeholder="e.g., Apple or INFY">
+
+        <div class="border-t border-gray-200 bg-gray-50 p-2 text-center">
+            <button id="toggleInputArea" class="text-indigo-600 hover:text-indigo-800 text-sm font-medium">
+                Show Input Form
+            </button>
+        </div>
+
+        <div id="inputArea" class="input-area-expanded p-4 border-t border-gray-200 bg-gray-50 rounded-b-lg">
+            <form id="chatForm">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
+                    <div>
+                        <label for="userStockQuery" class="block text-sm font-medium text-gray-700 mb-1">Company Name or Symbol</label>
+                        <input type="text" id="userStockQuery" name="userStockQuery" required
+                               class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                               placeholder="e.g., Apple or INFY">
+                    </div>
+                    <div>
+                        <label for="userQuestion" class="block text-sm font-medium text-gray-700 mb-1">Your Question / Analysis Goal</label>
+                        <input type="text" id="userQuestion" name="userQuestion"
+                               class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                               placeholder="Show chart and give recommendation">
+                    </div>
                 </div>
-                <div>
-                    <label for="userQuestion" class="block text-sm font-medium text-gray-700 mb-1">Your Question / Analysis Goal</label>
-                    <input type="text" id="userQuestion" name="userQuestion"
-                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
-                           placeholder="Show chart and give recommendation">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
+                     <div>
+                        <label for="userPositionShares" class="block text-sm font-medium text-gray-700 mb-1">Position: Shares (Optional)</label>
+                        <input type="number" step="any" id="userPositionShares" name="userPositionShares"
+                               class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                               placeholder="100">
+                    </div>
+                    <div>
+                        <label for="userPositionAvgPrice" class="block text-sm font-medium text-gray-700 mb-1">Position: Avg. Price (Optional)</label>
+                        <input type="number" step="any" id="userPositionAvgPrice" name="userPositionAvgPrice"
+                               class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                               placeholder="150.75">
+                    </div>
                 </div>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
-                 <div>
-                    <label for="userPositionShares" class="block text-sm font-medium text-gray-700 mb-1">Position: Shares (Optional)</label>
-                    <input type="number" step="any" id="userPositionShares" name="userPositionShares"
-                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
-                           placeholder="100">
+                <div class="flex items-center">
+                    <button type="submit"
+                            class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out">
+                        Send Analysis Request
+                    </button>
                 </div>
-                <div>
-                    <label for="userPositionAvgPrice" class="block text-sm font-medium text-gray-700 mb-1">Position: Avg. Price (Optional)</label>
-                    <input type="number" step="any" id="userPositionAvgPrice" name="userPositionAvgPrice"
-                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
-                           placeholder="150.75">
-                </div>
-            </div>
-            <div class="flex items-center">
-                <button type="submit"
-                        class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out">
-                    Send Analysis Request
-                </button>
-            </div>
-        </form>
+            </form>
+        </div>
     </div>
     <script>
         const chatForm = document.getElementById('chatForm');
         const chatMessages = document.getElementById('chatMessages');
-        // Changed input ID reference
         const userStockQueryInput = document.getElementById('userStockQuery');
         const userQuestionInput = document.getElementById('userQuestion');
         const userPositionSharesInput = document.getElementById('userPositionShares');
         const userPositionAvgPriceInput = document.getElementById('userPositionAvgPrice');
         const loadingIndicator = document.getElementById('loadingIndicator');
+        const inputArea = document.getElementById('inputArea');
+        const toggleInputAreaButton = document.getElementById('toggleInputArea');
 
-        const FASTAPI_ENDPOINT = '/analyze'; // Relative path
+        const FASTAPI_ENDPOINT = '/analyze';
+
+        // Function to toggle input area visibility
+        function toggleInputVisibility(show) {
+            if (show) {
+                inputArea.classList.remove('input-area-collapsed');
+                inputArea.classList.add('input-area-expanded');
+                toggleInputAreaButton.textContent = 'Hide Input Form';
+            } else {
+                inputArea.classList.add('input-area-collapsed');
+                inputArea.classList.remove('input-area-expanded');
+                toggleInputAreaButton.textContent = 'Show Input Form';
+            }
+        }
+
+        // Initial state: input area expanded
+        toggleInputVisibility(true);
+
+        toggleInputAreaButton.addEventListener('click', () => {
+            const isCollapsed = inputArea.classList.contains('input-area-collapsed');
+            toggleInputVisibility(isCollapsed); // If collapsed, show it, else hide it
+        });
+
 
         chatForm.addEventListener('submit', async function(event) {
             event.preventDefault();
 
-            // Get query from the new input field
             const stockQuery = userStockQueryInput.value.trim();
             const question = userQuestionInput.value.trim();
             const shares = userPositionSharesInput.value ? parseFloat(userPositionSharesInput.value) : null;
             const avgPrice = userPositionAvgPriceInput.value ? parseFloat(userPositionAvgPriceInput.value) : null;
 
-            if (!stockQuery) {
-                alert('Please enter a company name or stock symbol.');
-                return;
-            }
+            if (!stockQuery) { alert('Please enter a company name or stock symbol.'); return; }
 
-            // Display user's raw query
             let userMessageText = `Analyze "${stockQuery}".`;
             if (question) { userMessageText += ` My question: "${question}"`; }
             if (shares !== null && avgPrice !== null) { userMessageText += ` My position: ${shares} shares @ $${avgPrice.toFixed(2)}.`;}
             appendMessage(userMessageText, 'user');
 
-            // Clear inputs for next query
-            userStockQueryInput.value = ''; // Clear the main query input too
+            // Don't clear stock query input immediately, user might want to refine
+            // userStockQueryInput.value = '';
             userQuestionInput.value = '';
             userPositionSharesInput.value = '';
             userPositionAvgPriceInput.value = '';
 
             loadingIndicator.classList.remove('hidden');
             chatForm.querySelector('button[type="submit"]').disabled = true;
+            toggleInputVisibility(false); // Collapse input area after submit
 
             try {
-                // Send user_stock_query to the backend
-                const requestBody = {
-                    user_stock_query: stockQuery,
-                    user_question: question || null,
-                };
-                if (shares !== null && avgPrice !== null) {
-                    requestBody.user_position_shares = shares;
-                    requestBody.user_position_avg_price = avgPrice;
-                }
+                const requestBody = { user_stock_query: stockQuery, user_question: question || null };
+                if (shares !== null && avgPrice !== null) { requestBody.user_position_shares = shares; requestBody.user_position_avg_price = avgPrice; }
 
                 const response = await fetch(FASTAPI_ENDPOINT, {
                     method: 'POST',
@@ -149,11 +183,11 @@
                 appendMessage(`Error: ${error.message}`, 'bot', true);
                 loadingIndicator.classList.add('hidden');
                 chatForm.querySelector('button[type="submit"]').disabled = false;
+                toggleInputVisibility(true); // Re-show input on error
             }
         });
 
         function appendMessage(text, sender, isError = false) {
-            // (appendMessage logic remains the same)
             const messageDiv = document.createElement('div');
             messageDiv.classList.add('flex', 'mb-3');
             const bubbleDiv = document.createElement('div');
@@ -175,9 +209,8 @@
         }
 
         function appendAnalysisResult(result) {
-            // Display the resolved symbol if available
             let title = `Analysis for "${escapeHtml(result.user_stock_query || 'N/A')}"`;
-            if(result.stock_symbol) {
+            if(result.stock_symbol && result.user_stock_query.toUpperCase() !== result.stock_symbol.toUpperCase()) { // Show resolved only if different
                 title += ` (Resolved to: ${escapeHtml(result.stock_symbol)})`;
             }
             let botMessageHtml = `<p><strong>${title}:</strong></p>`;
@@ -186,21 +219,19 @@
                 botMessageHtml += `<div class="mt-2 p-2 bg-red-50 border border-red-200 rounded-md text-red-700"><strong>Error:</strong> ${escapeHtml(result.error_message)}</div>`;
             }
 
-            // Display Chart(s)
             if (result.generated_chart_urls && result.generated_chart_urls.length > 0) {
                 botMessageHtml += `<div class="mt-3"><strong>Generated Chart(s):</strong>`;
                 result.generated_chart_urls.forEach(urlOrError => {
-                    if (urlOrError.startsWith("Error:")) {
-                         botMessageHtml += `<p class="text-red-600 text-sm mt-1">${escapeHtml(urlOrError)}</p>`;
+                    if (urlOrError.startsWith("Error:") || urlOrError.includes("disabled")) { // Check for disabled message too
+                         botMessageHtml += `<p class="text-gray-600 text-sm mt-1">${escapeHtml(urlOrError)}</p>`;
                     } else {
                          const imageUrl = urlOrError;
-                         botMessageHtml += `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(result.stock_symbol)} Chart" class="mt-2">`;
+                         botMessageHtml += `<img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(result.stock_symbol || 'Stock')} Chart" class="mt-2">`;
                     }
                 });
                 botMessageHtml += `</div>`;
             }
 
-            // Display Text Summaries
             if (result.technical_analysis_summary) {
                 botMessageHtml += `<div class="mt-3"><strong>Technical Analysis:</strong><pre class="mt-1">${escapeHtml(result.technical_analysis_summary)}</pre></div>`;
             }
@@ -213,14 +244,13 @@
             if (result.position_specific_advice) {
                 botMessageHtml += `<div class="mt-3"><strong>Position Advice:</strong><pre class="mt-1">${escapeHtml(result.position_specific_advice)}</pre></div>`;
             }
-            if (!result.technical_analysis_summary && !result.fundamental_analysis_summary && !result.final_recommendation && !result.error_message && (!result.generated_chart_urls || result.generated_chart_urls.length === 0)) {
+            if (!result.technical_analysis_summary && !result.fundamental_analysis_summary && !result.final_recommendation && !result.error_message && (!result.generated_chart_urls || result.generated_chart_urls.length === 0 || result.generated_chart_urls[0].includes("disabled"))) {
                  botMessageHtml += "<p class='mt-2 text-gray-600'>No specific analysis data or chart returned.</p>";
             }
             appendMessage(botMessageHtml, 'bot');
         }
 
         function escapeHtml(unsafe) {
-            // (escapeHtml logic remains the same)
             if (unsafe === null || typeof unsafe === 'undefined') { return ''; }
             return unsafe.toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
         }
