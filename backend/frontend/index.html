@@ -5,21 +5,40 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Stock Analyzer Chat</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
         #chatMessages::-webkit-scrollbar { width: 8px; }
         #chatMessages::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
         #chatMessages::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
         #chatMessages::-webkit-scrollbar-thumb:hover { background: #555; }
-        .chat-bubble { max-width: 80%; word-wrap: break-word; }
+
+        .chat-bubble {
+            max-width: 80%;
+            word-wrap: break-word;
+            font-family: 'Inter', sans-serif;
+        }
         .user-bubble { background-color: #DCF8C6; align-self: flex-end; }
         .bot-bubble { background-color: #F0F0F0; align-self: flex-start; }
-        .bot-bubble strong { color: #2c5282; }
-        .bot-bubble pre { background-color: #e2e8f0; padding: 0.5rem; border-radius: 0.25rem; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; font-size: 0.875rem; }
+        .bot-bubble strong { color: #2c5282; font-weight: 600; }
+        .bot-bubble pre {
+            background-color: #e2e8f0;
+            padding: 0.5rem;
+            border-radius: 0.25rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: 'Menlo', 'Consolas', 'Liberation Mono', monospace;
+            font-size: 0.875rem;
+        }
         .bot-bubble img { max-width: 100%; height: auto; border-radius: 0.5rem; margin-top: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin: 0 auto; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
-        /* Styles for collapsible input area */
         .input-area-collapsed {
             max-height: 0;
             overflow: hidden;
@@ -29,12 +48,36 @@
             transition: max-height 0.3s ease-out, padding 0.3s ease-out, border-width 0.3s ease-out;
         }
         .input-area-expanded {
-            max-height: 500px; /* Adjust as needed to fit content */
+            max-height: 500px;
             transition: max-height 0.5s ease-in;
+        }
+        .analyzed-focus-display {
+            font-style: italic;
+            color: #4a5568;
+            font-size: 0.8rem;
+            margin-top: 0.25rem;
+            padding-left: 0.5rem;
+            border-left: 2px solid #a0aec0;
+        }
+         .direct-answer-section {
+            margin-top: 0.75rem;
+            padding: 0.75rem;
+            background-color: #ebf8ff;
+            border-left: 4px solid #4299e1;
+            border-radius: 0.375rem;
+            font-size: 0.9rem;
+        }
+        .direct-answer-section p {
+            margin-top: 0.25rem;
+        }
+        .section-title { /* For section titles like "Regarding your question" */
+            font-weight: 600; /* Make it bolder */
+            color: #2d3748; /* Tailwind gray-800 */
+            margin-bottom: 0.25rem;
         }
     </style>
 </head>
-<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen font-sans">
+<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen">
     <div class="bg-white shadow-xl rounded-lg w-full max-w-2xl flex flex-col" style="height: 90vh;">
         <header class="bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-4 rounded-t-lg">
             <h1 class="text-2xl font-semibold text-center">AI Stock Analyzer</h1>
@@ -71,7 +114,7 @@
                         <label for="userQuestion" class="block text-sm font-medium text-gray-700 mb-1">Your Question / Analysis Goal</label>
                         <input type="text" id="userQuestion" name="userQuestion"
                                class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
-                               placeholder="Show chart and give recommendation">
+                               placeholder="Is it a good buy?">
                     </div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
@@ -110,7 +153,6 @@
 
         const FASTAPI_ENDPOINT = '/analyze';
 
-        // Function to toggle input area visibility
         function toggleInputVisibility(show) {
             if (show) {
                 inputArea.classList.remove('input-area-collapsed');
@@ -123,12 +165,11 @@
             }
         }
 
-        // Initial state: input area expanded
         toggleInputVisibility(true);
 
         toggleInputAreaButton.addEventListener('click', () => {
             const isCollapsed = inputArea.classList.contains('input-area-collapsed');
-            toggleInputVisibility(isCollapsed); // If collapsed, show it, else hide it
+            toggleInputVisibility(isCollapsed);
         });
 
 
@@ -147,15 +188,13 @@
             if (shares !== null && avgPrice !== null) { userMessageText += ` My position: ${shares} shares @ $${avgPrice.toFixed(2)}.`;}
             appendMessage(userMessageText, 'user');
 
-            // Don't clear stock query input immediately, user might want to refine
-            // userStockQueryInput.value = '';
             userQuestionInput.value = '';
             userPositionSharesInput.value = '';
             userPositionAvgPriceInput.value = '';
 
             loadingIndicator.classList.remove('hidden');
             chatForm.querySelector('button[type="submit"]').disabled = true;
-            toggleInputVisibility(false); // Collapse input area after submit
+            toggleInputVisibility(false);
 
             try {
                 const requestBody = { user_stock_query: stockQuery, user_question: question || null };
@@ -183,7 +222,7 @@
                 appendMessage(`Error: ${error.message}`, 'bot', true);
                 loadingIndicator.classList.add('hidden');
                 chatForm.querySelector('button[type="submit"]').disabled = false;
-                toggleInputVisibility(true); // Re-show input on error
+                toggleInputVisibility(true);
             }
         });
 
@@ -210,19 +249,39 @@
 
         function appendAnalysisResult(result) {
             let title = `Analysis for "${escapeHtml(result.user_stock_query || 'N/A')}"`;
-            if(result.stock_symbol && result.user_stock_query.toUpperCase() !== result.stock_symbol.toUpperCase()) { // Show resolved only if different
+            if(result.stock_symbol && result.user_stock_query.toUpperCase() !== result.stock_symbol.toUpperCase()) {
                 title += ` (Resolved to: ${escapeHtml(result.stock_symbol)})`;
             }
             let botMessageHtml = `<p><strong>${title}:</strong></p>`;
+
+            if (result.analyzed_user_query_focus &&
+                result.analyzed_user_query_focus.toLowerCase() !== "general analysis and recommendation" &&
+                result.analyzed_user_query_focus !== result.original_user_question) {
+                botMessageHtml += `<div class="analyzed-focus-display">AI interpreted focus: ${escapeHtml(result.analyzed_user_query_focus)}</div>`;
+            }
 
             if (result.error_message) {
                 botMessageHtml += `<div class="mt-2 p-2 bg-red-50 border border-red-200 rounded-md text-red-700"><strong>Error:</strong> ${escapeHtml(result.error_message)}</div>`;
             }
 
+            // --- Display Direct Answer to User's Question ---
+            if (result.original_user_question) { // Show this section if there was an original question
+                botMessageHtml += `<div class="direct-answer-section">`;
+                botMessageHtml += `<p class="section-title">Regarding your question: "${escapeHtml(result.original_user_question)}"</p>`;
+                if (result.direct_answer_to_user_question) {
+                    botMessageHtml += `<p>${escapeHtml(result.direct_answer_to_user_question)}</p>`;
+                } else if (!result.error_message) { // If no direct answer but also no major error yet
+                    botMessageHtml += `<p class="text-gray-600 text-sm">The analysis below provides general insights. If your specific question wasn't fully addressed, please try rephrasing or asking a follow-up.</p>`;
+                }
+                botMessageHtml += `</div>`;
+            }
+
+
+            // --- Display Chart(s) ---
             if (result.generated_chart_urls && result.generated_chart_urls.length > 0) {
                 botMessageHtml += `<div class="mt-3"><strong>Generated Chart(s):</strong>`;
                 result.generated_chart_urls.forEach(urlOrError => {
-                    if (urlOrError.startsWith("Error:") || urlOrError.includes("disabled")) { // Check for disabled message too
+                    if (urlOrError.startsWith("Error:") || urlOrError.includes("disabled")) {
                          botMessageHtml += `<p class="text-gray-600 text-sm mt-1">${escapeHtml(urlOrError)}</p>`;
                     } else {
                          const imageUrl = urlOrError;
@@ -232,19 +291,28 @@
                 botMessageHtml += `</div>`;
             }
 
+            // --- Display Summaries (Optional) ---
             if (result.technical_analysis_summary) {
-                botMessageHtml += `<div class="mt-3"><strong>Technical Analysis:</strong><pre class="mt-1">${escapeHtml(result.technical_analysis_summary)}</pre></div>`;
+                botMessageHtml += `<div class="mt-3"><strong>Technical Analysis Summary:</strong><pre class="mt-1">${escapeHtml(result.technical_analysis_summary)}</pre></div>`;
             }
             if (result.fundamental_analysis_summary) {
-                botMessageHtml += `<div class="mt-3"><strong>Fundamental Analysis:</strong><pre class="mt-1">${escapeHtml(result.fundamental_analysis_summary)}</pre></div>`;
+                botMessageHtml += `<div class="mt-3"><strong>Fundamental Analysis Summary:</strong><pre class="mt-1">${escapeHtml(result.fundamental_analysis_summary)}</pre></div>`;
             }
+
+            // --- Display Overall Recommendation ---
             if (result.final_recommendation) {
                 botMessageHtml += `<div class="mt-3"><strong>Overall Recommendation:</strong><pre class="mt-1">${escapeHtml(result.final_recommendation)}</pre></div>`;
             }
+
+            // --- Display Position Advice ---
             if (result.position_specific_advice) {
                 botMessageHtml += `<div class="mt-3"><strong>Position Advice:</strong><pre class="mt-1">${escapeHtml(result.position_specific_advice)}</pre></div>`;
             }
-            if (!result.technical_analysis_summary && !result.fundamental_analysis_summary && !result.final_recommendation && !result.error_message && (!result.generated_chart_urls || result.generated_chart_urls.length === 0 || result.generated_chart_urls[0].includes("disabled"))) {
+
+            const hasPrimaryContent = result.direct_answer_to_user_question || result.final_recommendation || result.position_specific_advice;
+            const hasCharts = result.generated_chart_urls && result.generated_chart_urls.length > 0 && !result.generated_chart_urls[0].includes("disabled");
+
+            if (!hasPrimaryContent && !hasCharts && !result.error_message && !result.original_user_question) { // Added check for original question
                  botMessageHtml += "<p class='mt-2 text-gray-600'>No specific analysis data or chart returned.</p>";
             }
             appendMessage(botMessageHtml, 'bot');

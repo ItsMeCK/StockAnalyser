@@ -6,8 +6,8 @@ from typing import TypedDict, List, Optional, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate  # For structured prompts
-from langchain_core.output_parsers import StrOutputParser  # For simple string output
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
 import yfinance as yf
 import pandas as pd
@@ -38,13 +38,17 @@ LANGCHAIN_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", os.getenv(ENV_LANGCHAIN_END
 LANGCHAIN_API_KEY = os.getenv("LANGSMITH_API_KEY", os.getenv(ENV_LANGCHAIN_API_KEY))
 LANGCHAIN_PROJECT = os.getenv("LANGSMITH_PROJECT", os.getenv(ENV_LANGCHAIN_PROJECT, "Stock Analyzer Chat App Async"))
 
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o")  # Changed to gpt-4o for better reasoning
-LLM_SYMBOL_RESOLUTION_MODEL = os.getenv("LLM_SYMBOL_RESOLUTION_MODEL",
-                                        "gpt-3.5-turbo")  # Cheaper/faster for symbol resolution
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.4))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 500))
-POSITION_ADVICE_MAX_TOKENS = int(os.getenv("POSITION_ADVICE_MAX_TOKENS", 700))
-TOOL_SELECTOR_LLM_MAX_TOKENS = int(os.getenv("TOOL_SELECTOR_LLM_MAX_TOKENS", 250))
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o")
+LLM_SYMBOL_RESOLUTION_MODEL = os.getenv("LLM_SYMBOL_RESOLUTION_MODEL", "gpt-3.5-turbo")
+LLM_QUERY_ANALYZER_MODEL = os.getenv("LLM_QUERY_ANALYZER_MODEL", "gpt-3.5-turbo")
+LLM_DIRECT_ANSWER_MODEL = os.getenv("LLM_DIRECT_ANSWER_MODEL", "gpt-4o")
+
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.3))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 300))
+POSITION_ADVICE_MAX_TOKENS = int(os.getenv("POSITION_ADVICE_MAX_TOKENS", 500))
+TOOL_SELECTOR_LLM_MAX_TOKENS = int(os.getenv("TOOL_SELECTOR_LLM_MAX_TOKENS", 200))
+QUESTION_ENHANCER_MAX_TOKENS = int(os.getenv("QUESTION_ENHANCER_MAX_TOKENS", 150))
+DIRECT_ANSWER_MAX_TOKENS = int(os.getenv("DIRECT_ANSWER_MAX_TOKENS", 400))
 
 CHARTS_DIR = "/tmp/charts"
 try:
@@ -59,6 +63,12 @@ tool_descriptions_for_llm = ""
 class ToolSelection(BaseModel):
     tool_names: List[str] = Field(
         description="List of technical indicator tool names to be called (e.g., moving_averages, oscillators).")
+
+
+class QueryAnalysisOutput(BaseModel):
+    focus: str = Field(description="A short phrase describing the primary focus of the user's question.")
+    data_type_needed: str = Field(
+        description="The primary type of data needed to answer: 'technical', 'fundamental', 'both', or 'general'.")
 
 
 def initialize_analyzer():
@@ -99,11 +109,13 @@ def initialize_analyzer():
 llm = None
 tool_selector_llm = None
 llm_pos_advice = None
-llm_symbol_resolver = None  # New LLM instance for symbol resolution
+llm_symbol_resolver = None
+llm_query_analyzer = None
+llm_direct_answerer = None
 
 
 def get_llms():
-    global llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver
+    global llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver, llm_query_analyzer, llm_direct_answerer
     if llm is None: llm = ChatOpenAI(model=LLM_MODEL_NAME, temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS)
     if tool_selector_llm is None: tool_selector_llm = ChatOpenAI(model=LLM_MODEL_NAME, temperature=0.2,
                                                                  max_tokens=TOOL_SELECTOR_LLM_MAX_TOKENS)
@@ -112,10 +124,22 @@ def get_llms():
     if llm_symbol_resolver is None:
         llm_symbol_resolver = ChatOpenAI(
             model=LLM_SYMBOL_RESOLUTION_MODEL,
-            temperature=0.0,  # Low temperature for factual recall
-            max_tokens=50  # Ticker symbols are short
+            temperature=0.0,
+            max_tokens=50
         )
-    return llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver
+    if llm_query_analyzer is None:
+        llm_query_analyzer = ChatOpenAI(
+            model=LLM_QUERY_ANALYZER_MODEL,
+            temperature=0.1,
+            max_tokens=QUESTION_ENHANCER_MAX_TOKENS
+        )
+    if llm_direct_answerer is None:
+        llm_direct_answerer = ChatOpenAI(
+            model=LLM_DIRECT_ANSWER_MODEL,
+            temperature=0.5,
+            max_tokens=DIRECT_ANSWER_MAX_TOKENS
+        )
+    return llm, tool_selector_llm, llm_pos_advice, llm_symbol_resolver, llm_query_analyzer, llm_direct_answerer
 
 
 def _sanitize_indicator_value(value: Any) -> Any:
@@ -233,7 +257,7 @@ available_technical_indicator_tools = {
 }
 
 
-# --- Chart Generation Function (Internal Helper, Not a Tool) ---
+# --- Chart Generation Function (Commented out as per user request) ---
 # def _generate_chart_with_indicators(daily_data_json: str, daily_indicators: Dict[str, Dict], stock_symbol: str) -> Dict[str, Optional[str]]:
 #     # ... chart generation logic ...
 #     pass
@@ -253,13 +277,21 @@ def sanitize_value(value: Any) -> Any:
 
 
 async def _is_valid_ticker_async(ticker_symbol: str) -> bool:
-    """Asynchronously checks if a ticker symbol is valid by fetching its info."""
+    """Asynchronously checks if a ticker symbol is valid by fetching its info or a small piece of history."""
     try:
         loop = asyncio.get_event_loop()
-        stock_info = await loop.run_in_executor(None, lambda t: yf.Ticker(t).info, ticker_symbol)
-        return bool(stock_info and (stock_info.get('regularMarketPrice') is not None or stock_info.get('shortName')))
+        df_hist = await loop.run_in_executor(None, lambda t: yf.Ticker(t).history(period="1d"), ticker_symbol)
+        if not df_hist.empty:
+            return True
+        else:
+            stock_info = await loop.run_in_executor(None, lambda t: yf.Ticker(t).info, ticker_symbol)
+            return bool(
+                stock_info and (stock_info.get('regularMarketPrice') is not None or stock_info.get('shortName')))
     except Exception as e:
-        print(f"LOG: Validation check failed for {ticker_symbol}: {e}")
+        print(f"LOG: Validation check (history/info) failed for {ticker_symbol}: {e}")
+        if "401" in str(e).lower() or "unauthorized" in str(e).lower():
+            print(
+                f"CRITICAL_YFINANCE_AUTH_ERROR: Received 401 Unauthorized for {ticker_symbol}. This symbol may be valid but yfinance is blocked.")
         return False
 
 
@@ -272,21 +304,14 @@ def fetch_stock_data_yf_sync(ticker_symbol: str):
     """Synchronous helper to fetch data using yfinance. Assumes ticker_symbol is already validated."""
     stock = yf.Ticker(ticker_symbol)
     info = stock.info
-    # This was part of the old resolve_symbol node. Now fetch_stock_data_yf_sync assumes a valid ticker.
-    # If info is still None after yf.Ticker(valid_ticker).info, then it's truly no info.
     if not info:
-        print(f"Warning: No info dictionary returned by yfinance for already validated ticker '{ticker_symbol}'.")
-        # raise ValueError(f"Could not retrieve info for validated ticker '{ticker_symbol}'.") # Or handle as warning
-
+        print(f"Warning: No info dictionary returned by yfinance for ticker '{ticker_symbol}'.")
     daily_data = stock.history(period="1y")
     if daily_data.empty:
-        # This could happen if a ticker is valid (e.g., exists) but has no recent trading data.
         print(f"Warning: No daily historical data found for ticker '{ticker_symbol}'.")
-        # Depending on requirements, this could be an error or just a state to note.
-
     return {
         "resolved_symbol": ticker_symbol,
-        "info": info or {},  # Ensure info is dict
+        "info": info or {},
         "daily": daily_data,
         "weekly": stock.history(period="5y", interval="1wk"),
         "monthly": stock.history(period="max", interval="1mo"),
@@ -297,7 +322,7 @@ def fetch_stock_data_yf_sync(ticker_symbol: str):
 
 
 async def get_technical_analysis_summary_content(stock_symbol: str, executed_indicators: Dict[str, Dict[str, Dict]]):
-    current_llm, _, _, _ = get_llms()
+    current_llm, _, _, _, _, _ = get_llms()
     prompt_parts = [
         f"Analyze the technical outlook for {stock_symbol} based ONLY on the following calculated indicator values."]
     prompt_parts.append(
@@ -335,7 +360,7 @@ async def get_technical_analysis_summary_content(stock_symbol: str, executed_ind
 async def get_fundamental_analysis_summary_content(stock_symbol: str, stock_info_json: str,
                                                    financials_json: Optional[str], balance_sheet_json: Optional[str],
                                                    cashflow_json: Optional[str]):
-    current_llm, _, _, _ = get_llms()
+    current_llm, _, _, _, _, _ = get_llms()
     stock_info = json.loads(stock_info_json) if stock_info_json else {}
     financials = pd.read_json(StringIO(financials_json), orient='split') if financials_json else pd.DataFrame()
     balance_sheet = pd.read_json(StringIO(balance_sheet_json), orient='split') if balance_sheet_json else pd.DataFrame()
@@ -365,26 +390,97 @@ async def get_fundamental_analysis_summary_content(stock_symbol: str, stock_info
     return response.content
 
 
-async def generate_recommendation_content(stock_symbol: str, ta_summary: str, fa_summary: str,
-                                          user_question: Optional[str]):
-    current_llm, _, _, _ = get_llms()
-    default_question = "What is the overall recommendation (Buy, Sell, Hold) for this stock considering a medium-term investment horizon (6-12 months)?"
-    is_specific_question = bool(user_question) and user_question.lower().strip() != default_question.lower().strip()
+async def generate_direct_answer_to_question_content(
+        stock_symbol: str,
+        original_user_question: str,
+        analyzed_query_focus: Optional[str],
+        ta_summary: Optional[str],
+        fa_summary: Optional[str],
+        executed_technical_indicators: Optional[Dict[str, Dict[str, Dict]]],
+        stock_info_json: Optional[str]
+):
+    """Generates a direct answer to the user's specific question, grounded in TA/FA data."""
+    _, _, _, _, _, current_llm_direct_answerer = get_llms()
+
+    prompt_parts = [f"You are a financial analyst. The user is asking about {stock_symbol}."]
+    prompt_parts.append(f"User's Original Question: \"{original_user_question}\"")
+
+    if analyzed_query_focus and analyzed_query_focus.lower() not in ["general analysis and recommendation",
+                                                                     "general analysis"]:
+        prompt_parts.append(f"AI Analyzed Focus of Question: {analyzed_query_focus}")
+
+    prompt_parts.append(
+        "\nUse the following context to answer the user's question directly and concisely. Prioritize using the detailed data if relevant to the question's focus, otherwise use the summaries.")
+
+    # Get data_type_needed from the state (it's set in analyze_user_query_focus_node)
+    # This part requires 'state' to be passed or data_type_needed to be passed as an argument.
+    # For now, let's assume we'll make a decision based on analyzed_query_focus if data_type_needed isn't directly available here.
+    # A better way would be to pass data_type_needed to this function.
+    # For simplicity in this refactor, we'll infer based on focus.
+
+    data_type_needed_for_prompt = "general"  # Default
+    if analyzed_query_focus:
+        if "technical" in analyzed_query_focus.lower() or "chart" in analyzed_query_focus.lower() or "indicator" in analyzed_query_focus.lower():
+            data_type_needed_for_prompt = "technical"
+        if "fundamental" in analyzed_query_focus.lower() or "company" in analyzed_query_focus.lower() or "financials" in analyzed_query_focus.lower():
+            data_type_needed_for_prompt = "both" if data_type_needed_for_prompt == "technical" else "fundamental"
+
+    if data_type_needed_for_prompt in ["technical", "both"] and executed_technical_indicators:
+        daily_indicators = executed_technical_indicators.get('daily', {})
+        if daily_indicators:
+            tech_details = "Key Daily Technical Indicators:\n"
+            for tool_name, values in daily_indicators.items():
+                if values.get("error"): continue
+                filtered = {k: v for k, v in values.items() if
+                            not k.endswith("_series") and v is not None and not isinstance(v, str)}
+                if filtered: tech_details += f"  - {tool_name.replace('_', ' ').capitalize()}: {json.dumps(filtered)}\n"
+            if tech_details != "Key Daily Technical Indicators:\n":
+                prompt_parts.append(tech_details)
+
+    if data_type_needed_for_prompt in ["fundamental", "both"] and stock_info_json:
+        stock_info = json.loads(stock_info_json)
+        fund_details = "Key Fundamental Data:\n"
+        key_fund_fields = ['sector', 'industry', 'marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'dividendYield',
+                           'beta', '52WeekChange', 'bookValue', 'priceToBook']
+        added_fields = 0
+        for kf in key_fund_fields:
+            if stock_info.get(kf) is not None:
+                fund_details += f"  - {kf}: {stock_info.get(kf)}\n"
+                added_fields += 1
+        if stock_info.get('longBusinessSummary'):
+            fund_details += f"  - Business Summary Snippet: {stock_info['longBusinessSummary'][:200]}...\n"
+            added_fields += 1
+        if added_fields > 0:
+            prompt_parts.append(fund_details)
+
+    prompt_parts.append(f"Technical Analysis Summary (if available):\n{ta_summary or 'Not available.'}")
+    prompt_parts.append(f"Fundamental Analysis Summary (if available):\n{fa_summary or 'Not available.'}")
+
+    prompt_parts.append(
+        "\nInstruction: Based ONLY on the provided context and summaries above, provide a direct and concise answer (2-5 sentences) to the User's Original Question. "
+        "If the provided context does not contain enough information to directly answer the question, clearly state that the available analysis does not specifically address it, and briefly explain why (e.g., 'The analysis does not cover future price predictions.'). "
+        f"Focus on addressing the core of their query. STRICTLY ADHERE to the {DIRECT_ANSWER_MAX_TOKENS} token limit.")
+    prompt_parts.append("\nDirect Answer to User's Question:")
+
+    prompt = "\n".join(prompt_parts)
+    response = await current_llm_direct_answerer.ainvoke(prompt)
+    return response.content
+
+
+async def generate_recommendation_content(stock_symbol: str, ta_summary: str, fa_summary: str):
+    """Generates overall Buy/Sell/Hold recommendation."""
+    current_llm, _, _, _, _, _ = get_llms()
+
     prompt_parts = [f"Stock: {stock_symbol}"]
-    if is_specific_question: prompt_parts.append(f"User Question: {user_question}")
-    prompt_parts.append(f"Technical Analysis Summary:\n{ta_summary}");
-    prompt_parts.append(f"Fundamental Analysis Summary:\n{fa_summary}");
+    prompt_parts.append(f"Technical Analysis Summary:\n{ta_summary}")
+    prompt_parts.append(f"Fundamental Analysis Summary:\n{fa_summary}")
     prompt_parts.append("\nInstructions:")
-    if is_specific_question:
-        prompt_parts.append(
-            "1. First, directly answer the User Question based on the provided summaries (1-2 sentences).")
-        prompt_parts.append("2. Then, provide the overall recommendation (Buy/Sell/Hold).")
-        prompt_parts.append("3. Finally, list ONLY 2-3 main bullet points justifying the recommendation.")
-    else:
-        prompt_parts.append("1. Provide the overall recommendation (Buy/Sell/Hold).")
-        prompt_parts.append("2. List ONLY 2-3 main bullet points justifying the recommendation.")
-    prompt_parts.append(f"Be extremely concise. STRICTLY ADHERE to the {LLM_MAX_TOKENS} token limit.");
-    prompt_parts.append("\nResponse:")
+    prompt_parts.append("1. Provide the overall market recommendation (Buy/Sell/Hold).")
+    prompt_parts.append("2. List ONLY 2-3 main bullet points briefly justifying the recommendation.")
+    prompt_parts.append(
+        f"Be extremely concise. STRICTLY ADHERE to the {LLM_MAX_TOKENS} token limit for this recommendation section.");
+    prompt_parts.append("\nOverall Recommendation and Justification:")
+
     prompt = "\n".join(prompt_parts)
     response = await current_llm.ainvoke(prompt)
     return response.content
@@ -392,7 +488,7 @@ async def generate_recommendation_content(stock_symbol: str, ta_summary: str, fa
 
 async def generate_position_advice_content(stock_symbol: str, recommendation: str, user_position: dict,
                                            key_levels: Dict):
-    _, _, current_llm_pos_advice, _ = get_llms()
+    _, _, current_llm_pos_advice, _, _, _ = get_llms()
     if not user_position or not user_position.get("shares") or not user_position.get(
         "avg_price"): return "No position information provided or incomplete information."
     shares = user_position["shares"];
@@ -429,7 +525,10 @@ async def generate_position_advice_content(stock_symbol: str, recommendation: st
 # --- LangGraph State Definition ---
 class StockAnalysisState(TypedDict):
     user_stock_query: str
-    user_question: Optional[str]
+    user_question: Optional[str]  # Receives initial question from graph input
+    original_user_question: Optional[str]
+    analyzed_user_query_focus: Optional[str]
+    question_data_type_needed: Optional[str]
     user_position: Optional[dict]
     stock_symbol: Optional[str]
     error_message: Optional[str]
@@ -444,6 +543,7 @@ class StockAnalysisState(TypedDict):
     key_technical_levels: Optional[Dict[str, Optional[float]]]
     technical_analysis_summary: Optional[str]
     fundamental_analysis_summary: Optional[str]
+    direct_answer_to_user_question: Optional[str]
     final_recommendation: Optional[str]
     position_specific_advice: Optional[str]
 
@@ -453,6 +553,11 @@ async def start_node(state: StockAnalysisState) -> StockAnalysisState:
     print(f"LOG: Start node for query: {state['user_stock_query']}")
     state["error_message"] = ""
     state["stock_symbol"] = None
+    # Correctly copy 'user_question' from initial state (passed to app.ainvoke)
+    # to 'original_user_question' for use within the graph.
+    state["original_user_question"] = state.get("user_question")
+    state["analyzed_user_query_focus"] = None
+    state["question_data_type_needed"] = None
     state["selected_technical_tools"] = []
     state["executed_technical_indicators"] = {}
     state["generated_chart_urls"] = []
@@ -464,94 +569,114 @@ async def start_node(state: StockAnalysisState) -> StockAnalysisState:
     state["stock_cashflow_json"] = None
     state["technical_analysis_summary"] = None
     state["fundamental_analysis_summary"] = None
+    state["direct_answer_to_user_question"] = None
     state["final_recommendation"] = None
     state["position_specific_advice"] = None
     return state
 
 
+async def analyze_user_query_focus_node(state: StockAnalysisState) -> StockAnalysisState:
+    print(f"LOG: Analyze user query focus node for: '{state.get('original_user_question')}'")
+    _, _, _, _, current_llm_analyzer, _ = get_llms()
+    original_question = state.get("original_user_question")
+    stock_query_context = state.get("user_stock_query", "the specified stock")
+
+    if not original_question or original_question.strip() == "":
+        print("LOG: No user question provided to analyze for focus.")
+        state["analyzed_user_query_focus"] = "general analysis and recommendation"
+        state["question_data_type_needed"] = "general"
+        return state
+
+    try:
+        structured_llm = current_llm_analyzer.with_structured_output(QueryAnalysisOutput)
+        prompt_template_str = (
+            "You are an AI assistant. Analyze the user's question about a stock. "
+            "Identify the primary focus (e.g., 'buy/sell decision', 'long-term outlook', 'dividend info', 'risk assessment', 'specific indicator like RSI'). "
+            "Also, determine the primary type of data needed to answer it: 'technical', 'fundamental', 'both', or 'general' (if it's a broad question for overall analysis/recommendation). "
+            "If the question is very generic like 'general analysis' or 'what do you think?', set focus to 'general analysis and recommendation' and data_type_needed to 'general'.\n"
+            "User's question about {stock_context}: '{question}'"
+        )
+        analysis_output: QueryAnalysisOutput = await structured_llm.ainvoke(
+            prompt_template_str.format(
+                stock_context=state.get("stock_symbol") or stock_query_context,
+                question=original_question
+            )
+        )
+        state["analyzed_user_query_focus"] = analysis_output.focus.strip()
+        state["question_data_type_needed"] = analysis_output.data_type_needed.lower().strip()
+        print(
+            f"LOG: Original question: '{original_question}', Analyzed focus: '{state['analyzed_user_query_focus']}', Data needed: '{state['question_data_type_needed']}'")
+    except Exception as e:
+        print(f"ERROR in analyze_user_query_focus_node: {e}")
+        state["error_message"] += f"Failed to analyze user query focus: {str(e)}. "
+        state["analyzed_user_query_focus"] = "general analysis and recommendation"
+        state["question_data_type_needed"] = "general"
+    return state
+
+
 async def resolve_stock_symbol_node(state: StockAnalysisState) -> StockAnalysisState:
-    """
-    Attempts to resolve the user's stock query to a valid yfinance ticker symbol
-    using an LLM and fallback heuristics.
-    """
     print(f"LOG: Resolve symbol node for query: '{state['user_stock_query']}'")
     user_query_original = state["user_stock_query"]
-    user_query_upper = user_query_original.strip().upper()
-
-    _, _, _, current_llm_resolver = get_llms()  # Get the symbol resolver LLM
+    _, _, _, current_llm_resolver, _, _ = get_llms()
     resolved_symbol = None
-    error_msg = ""
-
-    # 1. Attempt resolution with LLM
+    error_accumulator = []
     try:
         print(f"LOG: Attempting LLM based symbol resolution for '{user_query_original}'...")
-        # Simple prompt for ticker suggestion
-        # You can make this more sophisticated with examples or specific instructions
-        # about common exchanges (NYSE, NASDAQ, NSE for India etc.)
         prompt_template = ChatPromptTemplate.from_messages([
             ("system",
              "You are an expert financial assistant. Your task is to identify the most likely official stock ticker symbol based on the user's query. "
              "If the company sounds Indian (e.g., Reliance, Infosys, Tata, HDFC), append '.NS' to the suggested symbol. "
-             "For well-known international companies (e.g., Apple, Microsoft, Google), provide their common US exchange ticker. "
+             "For well-known international companies (e.g., Apple, Microsoft, Google), provide their common US exchange ticker (e.g., AAPL, MSFT, GOOGL). "
              "If the query is already a valid-looking ticker, return it as is. "
-             "If highly ambiguous or unclear, return 'UNKNOWN'. "
+             "If highly ambiguous or unclear, or if the query is nonsensical as a company name, return 'UNKNOWN'. "
              "Respond with ONLY the ticker symbol or 'UNKNOWN'."),
             ("human", "User query: {query}")
         ])
-
-        # Create a simple chain for this
         resolve_chain = prompt_template | current_llm_resolver | StrOutputParser()
         llm_suggested_ticker = await resolve_chain.ainvoke({"query": user_query_original})
-        llm_suggested_ticker = llm_suggested_ticker.strip().upper()
+        llm_suggested_ticker = llm_suggested_ticker.strip().upper().replace("'", "").replace("\"", "")
         print(f"LOG: LLM suggested ticker: '{llm_suggested_ticker}'")
-
-        if llm_suggested_ticker and llm_suggested_ticker != "UNKNOWN":
-            if await _is_valid_ticker_async(llm_suggested_ticker):
-                resolved_symbol = llm_suggested_ticker
-                print(f"LOG: LLM suggested ticker '{resolved_symbol}' validated.")
-            else:
-                print(f"LOG: LLM suggested ticker '{llm_suggested_ticker}' was NOT valid.")
-                error_msg += f"LLM suggestion '{llm_suggested_ticker}' was not a valid ticker. "
+        if llm_suggested_ticker and llm_suggested_ticker not in ["UNKNOWN", "N/A", ""]:
+            resolved_symbol = llm_suggested_ticker
+            print(f"LOG: Using LLM suggested ticker '{resolved_symbol}'. Validation will occur during data fetch.")
         else:
-            print("LOG: LLM could not suggest a ticker or returned UNKNOWN.")
-            error_msg += "LLM could not confidently resolve the stock name. "
-
+            msg = "LLM could not confidently suggest a ticker or returned UNKNOWN/N/A."
+            print(f"LOG: {msg}");
+            error_accumulator.append(msg)
     except Exception as e:
-        print(f"ERROR: Exception during LLM symbol resolution: {e}")
-        error_msg += "Error during LLM symbol resolution. "
-
-    # 2. Fallback to heuristic if LLM fails or suggestion is invalid
+        msg = f"Exception during LLM symbol resolution: {e}";
+        print(f"ERROR: {msg}");
+        error_accumulator.append(msg)
     if not resolved_symbol:
-        print(f"LOG: LLM resolution failed or invalid. Falling back to heuristics for '{user_query_original}'...")
+        print(
+            f"LOG: LLM resolution failed or no confident suggestion. Falling back to heuristics for '{user_query_original}'...")
+        user_query_upper = user_query_original.strip().upper()
         potential_symbols_to_try = []
-        if re.match(r"^[A-Z0-9.-]+$", user_query_upper) and ('.' in user_query_upper or len(user_query_upper) <= 5):
-            potential_symbols_to_try.append(user_query_upper)
-        if not '.' in user_query_upper and re.match(r"^[A-Z\s]+$", user_query_upper):
-            potential_symbols_to_try.append(f"{user_query_upper.replace(' ', '')}.NS")
-        if user_query_upper not in potential_symbols_to_try:
-            potential_symbols_to_try.append(user_query_upper)
-        if ' ' not in user_query_upper and '.' not in user_query_upper and not user_query_upper.endswith(".NS"):
-            potential_symbols_to_try.append(f"{user_query_upper}.NS")
-
+        if re.match(r"^[A-Z0-9.-]+$", user_query_upper) and (
+                '.' in user_query_upper or len(user_query_upper) <= 5): potential_symbols_to_try.append(
+            user_query_upper)
+        if not '.' in user_query_upper and re.match(r"^[A-Z\s]+$", user_query_upper): potential_symbols_to_try.append(
+            f"{user_query_upper.replace(' ', '')}.NS")
+        if user_query_upper not in potential_symbols_to_try: potential_symbols_to_try.append(user_query_upper)
+        if ' ' not in user_query_upper and '.' not in user_query_upper and not user_query_upper.endswith(
+            ".NS"): potential_symbols_to_try.append(f"{user_query_upper}.NS")
         unique_symbols_to_try = list(dict.fromkeys(potential_symbols_to_try))
         print(f"LOG: Heuristic: Potential symbols to try: {unique_symbols_to_try}")
-
         for symbol_attempt in unique_symbols_to_try:
             if await _is_valid_ticker_async(symbol_attempt):
-                resolved_symbol = symbol_attempt
-                print(f"LOG: Heuristic resolved '{user_query_original}' to '{resolved_symbol}'")
-                error_msg = ""  # Clear previous error if heuristic succeeds
+                resolved_symbol = symbol_attempt;
+                print(f"LOG: Heuristic resolved '{user_query_original}' to '{resolved_symbol}'");
+                error_accumulator = [];
                 break
             else:
                 print(f"LOG: Heuristic: '{symbol_attempt}' is not valid.")
-
     if resolved_symbol:
         state["stock_symbol"] = resolved_symbol
     else:
-        final_error = error_msg if error_msg else f"Could not resolve '{user_query_original}' to a known stock symbol."
-        state["error_message"] = (state.get("error_message", "") + final_error).strip()
+        final_error_msg = " ".join(
+            error_accumulator) if error_accumulator else f"Could not resolve '{user_query_original}' to a known stock symbol."
+        state["error_message"] = (state.get("error_message", "") + final_error_msg).strip()
         print(f"LOG: Failed to resolve symbol for '{user_query_original}'. Final error: {state['error_message']}")
-
     return state
 
 
@@ -586,7 +711,6 @@ async def fetch_data_node(state: StockAnalysisState) -> StockAnalysisState:
             print(
                 f"Warning: Daily historical price data is empty for {state['stock_symbol']}. Some features might be affected.")
             if not state["raw_stock_data_json"]["weekly"] and not state["raw_stock_data_json"]["monthly"]:
-                # If all historical data is missing, this becomes a more significant issue.
                 state["error_message"] = (state.get("error_message",
                                                     "") + f" All historical price data is missing for {state['stock_symbol']}. Analysis will be limited. ").strip()
         print(f"LOG: Successfully fetched and serialized data for {state['stock_symbol']}.")
@@ -600,7 +724,7 @@ async def fetch_data_node(state: StockAnalysisState) -> StockAnalysisState:
 async def select_technical_tools_node(state: StockAnalysisState) -> StockAnalysisState:
     global tool_descriptions_for_llm
     print(f"LOG: Select technical INDICATOR tools node for {state['stock_symbol']}")
-    _, current_tool_selector_llm, _, _ = get_llms()
+    _, current_tool_selector_llm, _, _, _, _ = get_llms()
     if not tool_descriptions_for_llm or "Error:" in tool_descriptions_for_llm:
         state["error_message"] += "Critical error: Indicator tool descriptions not available. Defaulting. "
         state["selected_technical_tools"] = list(available_technical_indicator_tools.keys())
@@ -609,8 +733,10 @@ async def select_technical_tools_node(state: StockAnalysisState) -> StockAnalysi
         state["selected_technical_tools"] = []
         state["error_message"] += "Skipped indicator tool selection. "
         return state
-    user_query = state.get("user_question", "Provide a general technical analysis.")
-    prompt = f"Based on the user's query: \"{user_query}\" for the stock {state['stock_symbol']}, which of the following technical INDICATOR tools should be used?\nAvailable indicator tools and their descriptions:\n{tool_descriptions_for_llm}\n\nRespond with a JSON object containing a single key \"tool_names\" with a list of selected indicator tool names. For a general analysis, select all indicator tools: [\"moving_averages\", \"oscillators\", \"volatility\"]. Example response: {{\"tool_names\": [\"moving_averages\", \"oscillators\"]}}"
+    query_context = state.get("analyzed_user_query_focus") or state.get(
+        "original_user_question") or "Provide a general technical analysis."
+    print(f"LOG: Using query context for tool selection: '{query_context}'")
+    prompt = f"Based on the user's query focus: \"{query_context}\" for the stock {state['stock_symbol']}, which of the following technical INDICATOR tools should be used?\nAvailable indicator tools and their descriptions:\n{tool_descriptions_for_llm}\n\nRespond with a JSON object containing a single key \"tool_names\" with a list of selected indicator tool names. For a general analysis, select all indicator tools: [\"moving_averages\", \"oscillators\", \"volatility\"]. Example response: {{\"tool_names\": [\"moving_averages\", \"oscillators\"]}}"
     try:
         structured_llm = current_tool_selector_llm.with_structured_output(ToolSelection)
         response_model = await structured_llm.ainvoke(prompt)
@@ -722,25 +848,72 @@ async def fundamental_analysis_node(state: StockAnalysisState) -> StockAnalysisS
     return state
 
 
+async def generate_direct_answer_node(state: StockAnalysisState) -> StockAnalysisState:
+    """Generates a direct answer to the user's specific question if provided."""
+    print(f"LOG: Generate direct answer node for {state['stock_symbol']}")
+    original_question = state.get("original_user_question")
+    analyzed_focus = state.get("analyzed_user_query_focus")
+    ta_summary = state.get("technical_analysis_summary")
+    fa_summary = state.get("fundamental_analysis_summary")
+    executed_indicators = state.get("executed_technical_indicators")
+    stock_info_json = state.get("stock_info_json")
+    question_data_type = state.get("question_data_type_needed", "general")
+
+    if not original_question or original_question.strip() == "":
+        state["direct_answer_to_user_question"] = None
+        return state
+
+    if state["error_message"] or not ta_summary or not fa_summary or \
+            "N/A" in ta_summary or "N/A" in fa_summary or \
+            "failed" in ta_summary.lower() or "failed" in fa_summary.lower() or \
+            "cannot be generated" in ta_summary.lower() or "cannot be generated" in fa_summary.lower() or \
+            "No technical indicators available" in ta_summary:
+        state[
+            "direct_answer_to_user_question"] = "Could not answer your specific question due to missing analysis data or prior errors."
+        state["error_message"] += " Skipped direct question answering due to missing summaries. "
+        return state
+
+    try:
+        state["direct_answer_to_user_question"] = await generate_direct_answer_to_question_content(
+            state["stock_symbol"],
+            original_question,
+            analyzed_focus,
+            ta_summary,
+            fa_summary,
+            executed_indicators,
+            stock_info_json
+        )
+        print(f"LOG: Direct answer generated for: '{original_question}'")
+    except Exception as e:
+        print(f"ERROR in generate_direct_answer_node: {e}")
+        state["error_message"] += f"Failed to generate direct answer: {str(e)}. "
+        state[
+            "direct_answer_to_user_question"] = "Sorry, I encountered an issue trying to answer your specific question."
+    return state
+
+
 async def recommendation_node(state: StockAnalysisState) -> StockAnalysisState:
+    """Generates overall Buy/Sell/Hold recommendation."""
     print(f"LOG: Recommendation node for {state['stock_symbol']}")
     ta_summary = state.get("technical_analysis_summary", "TA info N/A.")
     fa_summary = state.get("fundamental_analysis_summary", "FA info N/A.")
     critical_ta = "cannot be generated" in ta_summary.lower() or "skipped" in ta_summary.lower() or "n/a" in ta_summary.lower() or "failed" in ta_summary.lower()
     critical_fa = "failed" in fa_summary.lower() or "skipped" in fa_summary.lower() or "n/a" in fa_summary.lower()
-    if state["error_message"] and (critical_ta or critical_fa): state[
-        "final_recommendation"] = "Cannot generate recommendation due to prior errors/missing analysis."; return state
+
+    if state["error_message"] and (critical_ta or critical_fa):
+        state["final_recommendation"] = "Cannot generate overall recommendation due to prior errors/missing analysis."
+        return state
     try:
         state["final_recommendation"] = await generate_recommendation_content(
             state["stock_symbol"],
             ta_summary,
-            fa_summary,
-            state.get("user_question")
+            fa_summary
         )
+        print("LOG: Overall recommendation generated.")
     except Exception as e:
         print(f"ERROR in recommendation_node: {e}")
-        state["error_message"] += f"Recommendation generation failed: {str(e)}. "
-        state["final_recommendation"] = "Failed to generate recommendation."
+        state["error_message"] += f"Overall recommendation generation failed: {str(e)}. "
+        state["final_recommendation"] = "Failed to generate overall recommendation."
     return state
 
 
@@ -768,25 +941,29 @@ def get_stock_analyzer_app():
     workflow = StateGraph(StockAnalysisState)
     workflow.add_node("start", start_node)
     workflow.add_node("resolve_symbol", resolve_stock_symbol_node)
+    workflow.add_node("analyze_query_focus", analyze_user_query_focus_node)
     workflow.add_node("fetch_data", fetch_data_node)
     workflow.add_node("select_technical_tools", select_technical_tools_node)
     workflow.add_node("execute_technical_tools", execute_technical_tools_node)
-    # workflow.add_node("generate_chart", generate_chart_node) # Chart node commented out
+    # workflow.add_node("generate_chart", generate_chart_node)
     workflow.add_node("summarize_technical_analysis", summarize_technical_analysis_node)
     workflow.add_node("fundamental_analysis", fundamental_analysis_node)
+    workflow.add_node("generate_direct_answer", generate_direct_answer_node)
     workflow.add_node("generate_recommendation", recommendation_node)
     workflow.add_node("generate_position_advice", position_advice_node)
 
     workflow.set_entry_point("start")
     workflow.add_edge("start", "resolve_symbol")
-    workflow.add_edge("resolve_symbol", "fetch_data")
+    workflow.add_edge("resolve_symbol", "analyze_query_focus")
+    workflow.add_edge("analyze_query_focus", "fetch_data")
     workflow.add_edge("fetch_data", "select_technical_tools")
     workflow.add_edge("select_technical_tools", "execute_technical_tools")
     # workflow.add_edge("execute_technical_tools", "generate_chart")
     # workflow.add_edge("generate_chart", "summarize_technical_analysis")
     workflow.add_edge("execute_technical_tools", "summarize_technical_analysis")
     workflow.add_edge("summarize_technical_analysis", "fundamental_analysis")
-    workflow.add_edge("fundamental_analysis", "generate_recommendation")
+    workflow.add_edge("fundamental_analysis", "generate_direct_answer")
+    workflow.add_edge("generate_direct_answer", "generate_recommendation")
     workflow.add_edge("generate_recommendation", "generate_position_advice")
     workflow.add_edge("generate_position_advice", END)
     return workflow.compile()
@@ -796,7 +973,7 @@ async def main_test():
     if initialize_analyzer():
         app = get_stock_analyzer_app()
         print("Stock Analyzer App compiled for standalone async testing.")
-        inputs = {"user_stock_query": "Infosys", "user_question": "General analysis",
+        inputs = {"user_stock_query": "Infosys", "user_question": "What are the short term risks for INFY?",
                   "user_position": {"shares": 10, "avg_price": 1400}}
         try:
             result_state = await app.ainvoke(inputs)
@@ -804,10 +981,14 @@ async def main_test():
             print(json.dumps(result_state, indent=2, default=str))
             api_response_data = {
                 "user_stock_query": result_state.get("user_stock_query"),
+                "original_user_question": result_state.get("original_user_question"),
+                "analyzed_user_query_focus": result_state.get("analyzed_user_query_focus"),
+                "question_data_type_needed": result_state.get("question_data_type_needed"),
                 "stock_symbol": result_state.get("stock_symbol"),
                 "generated_chart_urls": result_state.get("generated_chart_urls"),
                 "technical_analysis_summary": result_state.get("technical_analysis_summary"),
                 "fundamental_analysis_summary": result_state.get("fundamental_analysis_summary"),
+                "direct_answer_to_user_question": result_state.get("direct_answer_to_user_question"),
                 "final_recommendation": result_state.get("final_recommendation"),
                 "position_specific_advice": result_state.get("position_specific_advice"),
                 "error_message": result_state.get("error_message") if result_state.get("error_message",
