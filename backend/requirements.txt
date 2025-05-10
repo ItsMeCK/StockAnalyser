@@ -13,5 +13,11 @@
     pandas
     ta
     numpy
-    matplotlib # Added for chart generation
+    matplotlib
+    gunicorn
+    alpha_vantage
+    python-dotenv
+    httpx
+
+    # Added for chart generation
     # langsmith # Optional
